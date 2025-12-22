@@ -1,48 +1,65 @@
-# Wordpress - ignore core, configuration, examples, uploads and logs.
-# https://github.com/github/gitignore/blob/main/WordPress.gitignore
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
 
-# Core
-#
-# Note: if you want to stage/commit WP core files
-# you can delete this whole section/until Configuration.
-/wp-admin/
-/wp-content/index.php
-/wp-content/languages
-/wp-content/plugins/index.php
-/wp-content/themes/index.php
-/wp-includes/
-/index.php
-/license.txt
-/readme.html
-/wp-*.php
-/xmlrpc.php
+# Flask
+instance/
+.webassets-cache
 
-# Configuration
-wp-config.php
+# Local DBs / runtime artifacts
+attendance.db
+*.db
+*.sqlite
+*.sqlite3
 
-# Example themes
-/wp-content/themes/twenty*/
+# Google Credentials - NEVER COMMIT THIS!
+credentials.json
+*.json
+!android_app/**/*.json
 
-# Example plugin
-/wp-content/plugins/hello.php
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Uploads
-/wp-content/uploads/
+# Android
+*.iml
+.gradle
+/local.properties
+/.idea/workspace.xml
+/.idea/libraries
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
 
-# Log files
+# Android build outputs (nested)
+android_app/**/build/
+android_app/**/.gradle/
+android_app/**/*.apk
+android_app/**/*.aab
+*.apk
+*.aab
+
+# Eclipse/Buildship
+**/.settings/
+
+# Logs
 *.log
+attendance_log.csv
 
-# htaccess
-/.htaccess
+# Exports / uploads
+uploads/*.xlsx
+uploads/*.csv
 
-# All plugins
-#
-# Note: If you wish to whitelist plugins,
-# uncomment the next line
-#/wp-content/plugins
-
-# All themes
-#
-# Note: If you wish to whitelist themes,
-# uncomment the next line
-#/wp-content/themes
+# OS
+Thumbs.db
+.DS_Store

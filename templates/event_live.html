@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Attendance</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background: #0b1220; color: #e5e7eb; }
+    .wrap { max-width: 1000px; margin: 0 auto; }
+    .top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .title { font-size: 28px; font-weight: 700; margin: 0; }
+    .sub { color: #9ca3af; font-size: 14px; }
+    .card { margin-top: 18px; border: 1px solid rgba(229,231,235,0.14); border-radius: 16px; padding: 22px; background: rgba(17,24,39,0.55); }
+    .big { font-size: 86px; font-weight: 800; letter-spacing: -1px; line-height: 1; }
+    .label { color: #9ca3af; font-size: 16px; margin-top: 6px; }
+    .row { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; }
+    .stat { flex: 1 1 220px; border: 1px solid rgba(229,231,235,0.12); border-radius: 14px; padding: 14px; background: rgba(17,24,39,0.35); }
+    .stat b { font-size: 22px; }
+    .pulse { transition: transform 240ms ease, opacity 240ms ease; }
+    .pulse.bump { transform: scale(1.04); opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1 class="title">{{ event_name }}</h1>
+        <div class="sub">Live attendance · refresh every 5 seconds</div>
+      </div>
+      <div class="sub">Server time: <span id="serverTime">-</span></div>
+    </div>
+
+    <div class="card">
+      <div id="presentCount" class="big pulse">-</div>
+      <div class="label">Present</div>
+
+      <div class="row">
+        <div class="stat">
+          <div class="sub">Total</div>
+          <b id="total">-</b>
+        </div>
+        <div class="stat">
+          <div class="sub">Remaining</div>
+          <b id="remaining">-</b>
+        </div>
+        <div class="stat">
+          <div class="sub">Status</div>
+          <b id="active">-</b>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const EVENT_ID = {{ event_id }};
+    const POLL_MS = 5000;
+
+    const presentEl = document.getElementById('presentCount');
+    const totalEl = document.getElementById('total');
+    const remainingEl = document.getElementById('remaining');
+    const activeEl = document.getElementById('active');
+    const serverTimeEl = document.getElementById('serverTime');
+
+    let lastPresent = null;
+
+    function bump(el) {
+      el.classList.remove('bump');
+      // Force reflow
+      void el.offsetWidth;
+      el.classList.add('bump');
+    }
+
+    async function pollOnce() {
+      const res = await fetch(`/api/event/${encodeURIComponent(EVENT_ID)}/live`, { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const present = data.present ?? 0;
+      const total = data.total ?? 0;
+      const remaining = data.remaining ?? Math.max(total - present, 0);
+
+      if (lastPresent === null || present !== lastPresent) {
+        presentEl.textContent = present;
+        bump(presentEl);
+        lastPresent = present;
+      } else {
+        presentEl.textContent = present;
+      }
+
+      totalEl.textContent = total;
+      remainingEl.textContent = remaining;
+      activeEl.textContent = data.event?.is_active ? 'Active' : 'Closed';
+      serverTimeEl.textContent = data.server_time || '-';
+    }
+
+    pollOnce();
+    setInterval(pollOnce, POLL_MS);
+  </script>
+</body>
+</html>

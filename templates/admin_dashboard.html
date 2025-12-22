@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin Dashboard</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 18px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px; }
+    .grow { flex: 1 1 auto; }
+    label { display: block; font-size: 13px; margin-bottom: 6px; }
+    select, input { padding: 10px; width: 100%; box-sizing: border-box; }
+    button { padding: 10px 12px; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; font-size: 13px; }
+    th { background: #f9fafb; position: sticky; top: 0; }
+    .muted { color: #6b7280; font-size: 13px; }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; border: 1px solid #e5e7eb; font-size: 12px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    a { color: inherit; }
+  </style>
+</head>
+<body>
+  <div class="row" style="justify-content: space-between;">
+    <div>
+      <h2 style="margin: 0;">Admin Dashboard</h2>
+      <div class="muted">Live updates every 5 seconds · <span id="serverTime">-</span></div>
+    </div>
+    <form method="post" action="/admin/logout">
+      <button type="submit">Logout</button>
+    </form>
+  </div>
+
+  <div class="row" style="margin-top: 12px;">
+    <div class="card grow" style="min-width: 300px;">
+      <label for="eventSelect">Selected event</label>
+      <select id="eventSelect">
+        {% for e in events %}
+          <option value="{{ e.event_id }}" {% if e.event_id == selected_event_id %}selected{% endif %}>
+            #{{ e.event_id }} · {{ e.event_name }}{% if e.is_active %} (active){% endif %}
+          </option>
+        {% endfor %}
+      </select>
+
+      <div class="actions" style="margin-top: 10px;">
+        <a id="downloadAll" href="#" class="pill">Download Full List</a>
+        <a id="downloadPresent" href="#" class="pill">Download Present Only</a>
+      </div>
+
+      <div class="actions" style="margin-top: 10px;">
+        <form id="closeForm" method="post" style="margin: 0;"></form>
+        <form id="openForm" method="post" style="margin: 0;"></form>
+        <button id="closeBtn" type="button">Close event</button>
+        <button id="openBtn" type="button">Open event</button>
+      </div>
+    </div>
+
+    <div class="card" style="min-width: 260px;">
+      <div><span class="pill">Total</span> <b id="total">-</b></div>
+      <div style="margin-top: 6px;"><span class="pill">Present</span> <b id="present">-</b></div>
+      <div style="margin-top: 6px;"><span class="pill">Remaining</span> <b id="remaining">-</b></div>
+      <div style="margin-top: 6px;"><span class="pill">Total scanned</span> <b id="totalScanned">-</b></div>
+    </div>
+
+    <div class="card grow" style="min-width: 280px;">
+      <b>Device-wise stats</b>
+      <div id="deviceStats" class="muted" style="margin-top: 8px;">-</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 12px;">
+    <b>Live attendance</b>
+    <div class="muted" style="margin-top: 6px;">Showing roster with per-event status.</div>
+
+    <div style="max-height: 60vh; overflow: auto; margin-top: 10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>UID</th>
+            <th>Name</th>
+            <th>Branch</th>
+            <th>Year</th>
+            <th>Status</th>
+            <th>Time</th>
+            <th>Source</th>
+            <th>Device</th>
+          </tr>
+        </thead>
+        <tbody id="attendanceBody">
+          <tr><td colspan="8" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 12px;">
+    <b>Create event</b>
+    <form method="post" action="/admin/events/create" class="row" style="margin-top: 10px;">
+      <div style="flex: 2 1 220px;">
+        <label>Event name</label>
+        <input name="event_name" required />
+      </div>
+      <div style="flex: 1 1 160px;">
+        <label>Start time</label>
+        <input name="start_time" placeholder="optional" />
+      </div>
+      <div style="flex: 1 1 160px;">
+        <label>End time</label>
+        <input name="end_time" placeholder="optional" />
+      </div>
+      <div style="flex: 0 1 180px;">
+        <label>Set active</label>
+        <select name="is_active">
+          <option value="1">Yes</option>
+          <option value="0" selected>No</option>
+        </select>
+      </div>
+      <div style="flex: 0 1 auto;">
+        <button type="submit">Create</button>
+      </div>
+    </form>
+    <div class="muted" style="margin-top: 8px;">Tip: Keep only the current event active for faster device selection.</div>
+  </div>
+
+  <script>
+    const POLL_MS = 5000;
+
+    const eventSelect = document.getElementById('eventSelect');
+    const serverTime = document.getElementById('serverTime');
+
+    const totalEl = document.getElementById('total');
+    const presentEl = document.getElementById('present');
+    const remainingEl = document.getElementById('remaining');
+    const totalScannedEl = document.getElementById('totalScanned');
+
+    const deviceStatsEl = document.getElementById('deviceStats');
+    const attendanceBody = document.getElementById('attendanceBody');
+
+    const downloadAll = document.getElementById('downloadAll');
+    const downloadPresent = document.getElementById('downloadPresent');
+
+    const closeBtn = document.getElementById('closeBtn');
+    const openBtn = document.getElementById('openBtn');
+
+    function currentEventId() {
+      return eventSelect.value;
+    }
+
+    function updateLinksAndActions() {
+      const eid = currentEventId();
+      downloadAll.href = `/export?present_only=0&event_id=${encodeURIComponent(eid)}`;
+      downloadPresent.href = `/export?present_only=1&event_id=${encodeURIComponent(eid)}`;
+
+      closeBtn.onclick = () => {
+        fetch(`/admin/events/${encodeURIComponent(eid)}/close`, { method: 'POST' }).then(() => location.reload());
+      };
+      openBtn.onclick = () => {
+        fetch(`/admin/events/${encodeURIComponent(eid)}/open`, { method: 'POST' }).then(() => location.reload());
+      };
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    function renderDeviceStats(list) {
+      if (!Array.isArray(list) || list.length === 0) {
+        deviceStatsEl.textContent = 'No device stats yet.';
+        return;
+      }
+      deviceStatsEl.innerHTML = list
+        .map(d => `${escapeHtml(d.device_id)}: <b>${escapeHtml(d.present_count)}</b>`)
+        .join('<br/>');
+    }
+
+    function renderAttendance(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        attendanceBody.innerHTML = `<tr><td colspan="8" class="muted">No rows.</td></tr>`;
+        return;
+      }
+
+      attendanceBody.innerHTML = rows.map(r => {
+        const status = (r.status || '').toLowerCase() === 'present' ? 'Present' : 'Absent';
+        return `
+          <tr>
+            <td>${escapeHtml(r.uid)}</td>
+            <td>${escapeHtml(r.name)}</td>
+            <td>${escapeHtml(r.branch || '')}</td>
+            <td>${escapeHtml(r.year || '')}</td>
+            <td>${escapeHtml(status)}</td>
+            <td>${escapeHtml(r.timestamp || '')}</td>
+            <td>${escapeHtml(r.source || '')}</td>
+            <td>${escapeHtml(r.device_id || '')}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function pollOnce() {
+      const eid = currentEventId();
+      const res = await fetch(`/admin/api/dashboard?event_id=${encodeURIComponent(eid)}`, { cache: 'no-store' });
+      if (res.status === 401) {
+        location.href = '/admin/login';
+        return;
+      }
+      const data = await res.json();
+
+      serverTime.textContent = data.server_time || '-';
+
+      totalEl.textContent = data.summary?.total ?? '-';
+      presentEl.textContent = data.summary?.present ?? '-';
+      remainingEl.textContent = data.summary?.remaining ?? '-';
+      totalScannedEl.textContent = data.summary?.total_scanned ?? '-';
+
+      renderDeviceStats(data.device_stats);
+      renderAttendance(data.attendance);
+    }
+
+    eventSelect.addEventListener('change', () => {
+      updateLinksAndActions();
+      pollOnce();
+    });
+
+    updateLinksAndActions();
+    pollOnce();
+    setInterval(pollOnce, POLL_MS);
+  </script>
+</body>
+</html>

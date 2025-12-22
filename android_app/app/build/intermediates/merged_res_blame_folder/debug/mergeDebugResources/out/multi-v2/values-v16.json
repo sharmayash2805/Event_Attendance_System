@@ -1,0 +1,38 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.cu.attendance.app-mergeDebugResources-65:/values-v16/values-v16.xml",
+            "map": [
+                {
+                    "source": "C:\\Users\\Asus\\.gradle\\caches\\8.13\\transforms\\0a88d7da7c40522798da03c9d34af00f\\transformed\\core-1.12.0\\res\\values-v16\\values-v16.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endColumns": "65",
+                        "endOffsets": "116"
+                    }
+                },
+                {
+                    "source": "C:\\Users\\Asus\\.gradle\\caches\\8.13\\transforms\\d053e44c053b1d17c598e9c336773217\\transformed\\appcompat-1.6.1\\res\\values-v16\\values-v16.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endLines": "5",
+                        "endColumns": "12",
+                        "endOffsets": "223"
+                    },
+                    "to": {
+                        "startLines": "3",
+                        "startColumns": "4",
+                        "startOffsets": "121",
+                        "endLines": "6",
+                        "endColumns": "12",
+                        "endOffsets": "289"
+                    }
+                }
+            ]
+        }
+    ]
+}
