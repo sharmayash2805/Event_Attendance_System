@@ -1138,5 +1138,24 @@ def api_event_session(event_id: int):
     )
 
 
+@app.get("/api/event/<int:event_id>/roster")
+def api_event_roster(event_id: int):
+    """Public roster endpoint for Android clients.
+
+    Returns the student list imported for the event (UID/Name/Branch/Year).
+    """
+    event = _get_event(event_id)
+    if not event:
+        return jsonify({"error": "Not found"}), 404
+
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT uid, name, branch, year FROM students WHERE event_id = ? ORDER BY name, uid",
+            (event_id,),
+        ).fetchall()
+
+    return jsonify([dict(r) for r in rows])
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

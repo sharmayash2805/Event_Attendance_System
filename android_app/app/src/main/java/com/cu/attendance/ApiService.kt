@@ -103,6 +103,39 @@ object ApiService {
 		}
 	}
 
+	suspend fun fetchRoster(eventId: Long): List<StudentEntity> = withContext(Dispatchers.IO) {
+		try {
+			val request = Request.Builder()
+				.url(ApiClient.url("/api/event/$eventId/roster"))
+				.get()
+				.build()
+
+			ApiClient.client.newCall(request).execute().use { response ->
+				val bodyText = response.body?.string().orEmpty()
+				if (!response.isSuccessful) return@withContext emptyList<StudentEntity>()
+				val array = JSONArray(bodyText)
+				return@withContext buildList {
+					for (i in 0 until array.length()) {
+						val item = array.optJSONObject(i) ?: continue
+						add(
+							StudentEntity(
+								eventId = eventId,
+								uid = item.optString("uid", "").trim(),
+								name = item.optString("name", "").trim(),
+								branch = item.optString("branch", "").trim(),
+								year = item.optString("year", "").trim(),
+								status = "Absent",
+								timestamp = ""
+							)
+						)
+					}
+				}
+			}
+		} catch (_: Exception) {
+			emptyList()
+		}
+	}
+
 	suspend fun markAttendance(eventId: Long, uid: String, deviceId: String, deviceTimestamp: String): MarkResult =
 		withContext(Dispatchers.IO) {
 			try {

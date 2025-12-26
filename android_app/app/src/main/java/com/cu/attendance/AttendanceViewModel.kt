@@ -59,9 +59,50 @@ class AttendanceViewModel(application: Application) : AndroidViewModel(applicati
         _selectedEvent.value = next
         EventPrefs.saveSelectedEvent(getApplication(), next)
         refreshStats()
+        refreshRosterFromServer()
         refreshOpenSession()
         clearSearchResults()
         clearError()
+    }
+
+    fun refreshRosterFromServer() {
+        viewModelScope.launch {
+            val eventId = _selectedEvent.value?.eventId
+            if (eventId == null || eventId <= 0L) return@launch
+
+            try {
+                val roster = ApiService.fetchRoster(eventId)
+                if (roster.isEmpty()) return@launch
+
+                withContext(Dispatchers.IO) {
+                    val existing = database.studentDao().getAllStudents(eventId)
+                    val existingByUid = existing.associateBy { it.uid }
+
+                    val merged = roster.mapNotNull { remote ->
+                        val uid = remote.uid.trim()
+                        if (uid.isBlank()) return@mapNotNull null
+
+                        val local = existingByUid[uid]
+                        val keepStatus = local?.status == "Present" || local?.status == "Queued"
+
+                        remote.copy(
+                            status = if (keepStatus) local!!.status else "Absent",
+                            timestamp = if (keepStatus) local!!.timestamp else ""
+                        )
+                    }
+
+                    if (merged.isNotEmpty()) {
+                        database.studentDao().insertAll(merged)
+                    }
+                }
+
+                // Refresh local-based UI (search/stats) after syncing roster.
+                refreshStats()
+            } catch (e: Exception) {
+                // Keep it silent; roster sync is best-effort.
+                _error.value = "Failed to sync roster: ${e.message}"
+            }
+        }
     }
 
     private fun refreshOpenSession() {
@@ -116,26 +157,33 @@ class AttendanceViewModel(application: Application) : AndroidViewModel(applicati
     }
     fun refreshStats() {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                try {
-                    val eventId = _selectedEvent.value?.eventId
-                    if (eventId == null || eventId <= 0L) {
-						_stats.value = AttendanceStats(total = 0, present = 0, remaining = 0)
-						return@withContext
-					}
+            try {
+                val eventId = _selectedEvent.value?.eventId
+                if (eventId == null || eventId <= 0L) {
+                    _stats.value = AttendanceStats(total = 0, present = 0, remaining = 0)
+                    return@launch
+                }
 
+                val deviceId = DeviceIdProvider.getOrCreate(getApplication())
+                val server = ApiService.fetchStats(eventId = eventId, deviceId = deviceId)
+                if (server != null) {
+                    _stats.value = AttendanceStats(
+                        total = server.total,
+                        present = server.present,
+                        remaining = server.remaining
+                    )
+                    return@launch
+                }
+
+                // Offline fallback: use local Room DB.
+                val local = withContext(Dispatchers.IO) {
                     val total = database.studentDao().getCount(eventId)
                     val present = database.studentDao().getPresentCount(eventId)
-                    val remaining = total - present
-
-                    _stats.value = AttendanceStats(
-                        total = total,
-                        present = present,
-                        remaining = remaining
-                    )
-                } catch (e: Exception) {
-                    _error.value = "Failed to load stats: ${e.message}"
+                    AttendanceStats(total = total, present = present, remaining = (total - present).coerceAtLeast(0))
                 }
+                _stats.value = local
+            } catch (e: Exception) {
+                _error.value = "Failed to load stats: ${e.message}"
             }
         }
     }

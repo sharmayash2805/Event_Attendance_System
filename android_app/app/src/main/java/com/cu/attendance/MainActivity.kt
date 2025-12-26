@@ -150,6 +150,11 @@ class MainActivity : ComponentActivity() {
 											if (ok) "Connected to server" else "Not connected to server",
 											Toast.LENGTH_SHORT
 										).show()
+										if (ok) {
+											attendanceViewModel.refreshEvents()
+											attendanceViewModel.refreshStats()
+											attendanceViewModel.refreshRosterFromServer()
+										}
 									}
 								}
 							}
@@ -169,6 +174,7 @@ class MainActivity : ComponentActivity() {
 								// Refresh data immediately using the new base URL.
 								attendanceViewModel.refreshEvents()
 								attendanceViewModel.refreshStats()
+								attendanceViewModel.refreshRosterFromServer()
 								// Kick a one-time sync in case there is pending offline work.
 								SyncWork.enqueueOneTime(this@MainActivity)
 							}

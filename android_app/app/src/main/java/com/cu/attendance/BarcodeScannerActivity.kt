@@ -129,7 +129,7 @@ class BarcodeScannerActivity : ComponentActivity() {
 
             LaunchedEffect(Unit) {
                 while (true) {
-                    serverOnline = ScannerHelper.checkServer(this@BarcodeScannerActivity, eventId)
+                    serverOnline = ScannerHelper.checkServer(this@BarcodeScannerActivity, event.eventId)
                     kotlinx.coroutines.delay(5000)
                 }
             }
