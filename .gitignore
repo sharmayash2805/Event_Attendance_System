@@ -24,9 +24,7 @@ credentials.json
 !android_app/**/*.json
 
 # IDE
-**/.vscode/*
-!.vscode/tasks.json
-!.vscode/settings.json
+.vscode/
 .idea/
 *.swp
 *.swo
