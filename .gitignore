@@ -24,7 +24,9 @@ credentials.json
 !android_app/**/*.json
 
 # IDE
-.vscode/
+**/.vscode/*
+!.vscode/tasks.json
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo
@@ -33,6 +35,7 @@ credentials.json
 *.iml
 .gradle
 /local.properties
+android_app/**/local.properties
 /.idea/workspace.xml
 /.idea/libraries
 .DS_Store
