@@ -11,26 +11,21 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Upload
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -42,17 +37,15 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun HomeScreen(
     stats: AttendanceStats,
-    events: List<EventDto>,
     selectedEvent: SelectedEvent?,
-    onEventSelected: (EventDto) -> Unit,
+	openSession: SessionDto?,
     onScanClick: () -> Unit,
     onSearchClick: () -> Unit,
-    onImportClick: () -> Unit,
     onExportClick: () -> Unit,
-    onResetClick: () -> Unit,
-    serverLabel: String,
-    onServerSettingsClick: () -> Unit,
-    onTestServerClick: () -> Unit
+	onOpenServerSettings: () -> Unit,
+    connectionHint: String?,
+    serverStatusText: String,
+    onCheckServer: () -> Unit
 ) {
     val bg = Color(0xFF0E0E0E)
     val card = Color(0xFF1C1C1E)
@@ -68,116 +61,77 @@ fun HomeScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(bg)
+            .verticalScroll(rememberScrollState())
             .padding(20.dp)
     ) {
-        Row(
+        // 1) Current scanning target (read-only)
+        Surface(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            color = card,
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, Color(0x33FFFFFF))
         ) {
-            Text(
-                text = "AETHER",
-                color = Color.White,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            Surface(
-                color = card,
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, Color(0x33FFFFFF)),
-                onClick = onServerSettingsClick
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(text = "Server", color = textSecondary, fontSize = 12.sp)
-                    Text(text = serverLabel, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                }
-            }
-
-            Surface(
-                color = Color.Transparent,
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, Color(0x33FFFFFF)),
-                onClick = onTestServerClick
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(text = "Test", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                }
-            }
-
-            var eventMenuExpanded by remember { mutableStateOf(false) }
-
-            Surface(
-                color = Color.Transparent,
-                onClick = { eventMenuExpanded = true }
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = selectedEvent?.eventName ?: "Select Event",
-                        color = textSecondary,
-                        fontSize = 14.sp
-                    )
-                    Icon(
-                        imageVector = Icons.Default.ArrowDropDown,
-                        contentDescription = "Change event",
-                        tint = textSecondary
-                    )
-                }
-            }
-
-            DropdownMenu(
-                expanded = eventMenuExpanded,
-                onDismissRequest = { eventMenuExpanded = false }
-            ) {
-                if (events.isEmpty()) {
-                    DropdownMenuItem(
-                        text = { Text("No active events") },
-                        onClick = { eventMenuExpanded = false }
-                    )
-                } else {
-                    events.forEach { option ->
-                        DropdownMenuItem(
-                            text = { Text(option.eventName) },
-                            onClick = {
-                                eventMenuExpanded = false
-                                onEventSelected(option)
-                            }
-                        )
-                    }
-                }
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 14.dp)) {
+                Text(
+                    text = "Event",
+                    color = textSecondary,
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = selectedEvent?.eventName ?: "No active event",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Session",
+                    color = textSecondary,
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = openSession?.sessionName?.takeIf { it.isNotBlank() } ?: "No open session",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
-
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = "$percentage%",
-                color = Color.White,
-                fontSize = 42.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = "$present / $total Attendees",
-                color = textSecondary,
-                fontSize = 14.sp
-            )
-            Text(
-                text = "Remaining: $remaining",
-                color = textSecondary,
-                fontSize = 12.sp
-            )
+        // Online/Offline button (checks actual server reachability)
+        Spacer(modifier = Modifier.height(12.dp))
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color.Transparent,
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, Color(0x33FFFFFF)),
+            onClick = onCheckServer
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = "Server", color = textSecondary, fontSize = 12.sp)
+                Text(text = serverStatusText, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+		Spacer(modifier = Modifier.height(16.dp))
+
+		// 2) Event stats card
+		EventStatsCard(
+			cardColor = card,
+			secondaryText = textSecondary,
+			total = total,
+			present = present,
+			remaining = remaining,
+			percentage = percentage
+		)
+
+		Spacer(modifier = Modifier.height(22.dp))
 
         Button(
             onClick = onScanClick,
@@ -197,43 +151,39 @@ fun HomeScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+		Spacer(modifier = Modifier.height(18.dp))
 
-        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                FilledCardButton(
-                    text = "SEARCH DB",
-                    icon = Icons.Default.Search,
-                    iconTint = Color.White,
-                    background = card,
-                    onClick = onSearchClick,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlineCardButton(
-                    text = "IMPORT LIST",
-                    icon = Icons.Default.Download,
-                    onClick = onImportClick,
-                    modifier = Modifier.weight(1f)
-                )
-            }
+		// 4) Manual search
+		Surface(
+			modifier = Modifier
+				.fillMaxWidth()
+				.height(56.dp),
+			color = card,
+			shape = RoundedCornerShape(18.dp),
+			onClick = onSearchClick
+		) {
+			Row(
+				modifier = Modifier.fillMaxSize(),
+				horizontalArrangement = Arrangement.Center,
+				verticalAlignment = Alignment.CenterVertically
+			) {
+				Icon(Icons.Default.Search, contentDescription = null, tint = Color.White)
+				Spacer(modifier = Modifier.width(8.dp))
+				Text("SEARCH DATABASE", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+			}
+		}
 
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                FilledCardButton(
-                    text = "EXPORT DATA",
-                    icon = Icons.Default.Upload,
-                    iconTint = red,
-                    background = card,
-                    onClick = onExportClick,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlineCardButton(
-                    text = "RESET DATA",
-                    icon = Icons.Default.Delete,
-                    onClick = onResetClick,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
+		Spacer(modifier = Modifier.height(16.dp))
+
+        // 5) Export attendance
+        FilledCardButton(
+            text = "EXPORT ATTENDANCE",
+            icon = Icons.Default.Upload,
+            iconTint = red,
+            background = card,
+            onClick = onExportClick,
+            modifier = Modifier.fillMaxWidth()
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -246,8 +196,62 @@ fun HomeScreen(
                 color = textSecondary,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium
+				,
+				modifier = Modifier.pointerInput(Unit) {
+					detectTapGestures(
+						onLongPress = { onOpenServerSettings() }
+					)
+				}
             )
         }
+    }
+}
+
+@Composable
+private fun EventStatsCard(
+    cardColor: Color,
+    secondaryText: Color,
+    total: Int,
+    present: Int,
+    remaining: Int,
+    percentage: Int
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = cardColor,
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, Color(0x33FFFFFF))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "Event Stats",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                StatsItem(label = "Total Registered", value = total.toString(), secondaryText = secondaryText)
+                StatsItem(label = "Present", value = present.toString(), secondaryText = secondaryText)
+                StatsItem(label = "Remaining", value = remaining.toString(), secondaryText = secondaryText)
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "$percentage%",
+                color = Color.White,
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatsItem(label: String, value: String, secondaryText: Color) {
+    Column(horizontalAlignment = Alignment.Start) {
+        Text(text = label, color = secondaryText, fontSize = 11.sp)
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(text = value, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 

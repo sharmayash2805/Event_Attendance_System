@@ -5,22 +5,18 @@ import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.ViewModelProvider
 import com.cu.attendance.ui.export.ExportFormat
 import com.cu.attendance.ui.export.ExportScreen
@@ -36,14 +32,9 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
 
 	private var showSearchScreen by mutableStateOf(false)
-	private var showImportScreen by mutableStateOf(false)
-	private var importedStudents by mutableStateOf<List<StudentImportRow>>(emptyList())
 	private var showExportScreen by mutableStateOf(false)
 	private var showServerDialog by mutableStateOf(false)
 	private var serverUrl by mutableStateOf("")
-	private var testingServer by mutableStateOf(false)
-	private var showResetDialog by mutableStateOf(false)
-	private var resetMessage by mutableStateOf("")
 
 	private lateinit var database: AppDatabase
 	private lateinit var attendanceViewModel: AttendanceViewModel
@@ -79,153 +70,91 @@ class MainActivity : ComponentActivity() {
 			val stats by attendanceViewModel.stats.collectAsState()
 			val events by attendanceViewModel.events.collectAsState()
 			val selectedEvent by attendanceViewModel.selectedEvent.collectAsState()
+			val openSession by attendanceViewModel.openSession.collectAsState()
+			val vmError by attendanceViewModel.error.collectAsState()
+			var serverStatusText by remember { mutableStateOf("Tap to check") }
+			var checkingServer by remember { mutableStateOf(false) }
 
-			val filePicker = rememberLauncherForActivityResult(
-				ActivityResultContracts.OpenDocument()
-			) { uri: Uri? ->
-				uri?.let {
-					lifecycleScope.launch(Dispatchers.IO) {
-						try {
-							// Persist temporary read permission to avoid SecurityException on some providers.
-							val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-							try {
-								contentResolver.takePersistableUriPermission(it, flags)
-							} catch (_: SecurityException) {
-								// Not all providers allow persistable permission; ignore.
-							}
+			LaunchedEffect(Unit) {
+				// Initial best-effort check (doesn't block UI).
+				checkingServer = true
+				val ok = try {
+					ScannerHelper.checkServer(this@MainActivity, selectedEvent?.eventId)
+				} catch (_: Exception) {
+					false
+				}
+				serverStatusText = if (ok) "Online" else "Offline"
+				checkingServer = false
+			}
 
-							val students = readExcelFile(this@MainActivity, it)
-							withContext(Dispatchers.Main) {
-								if (students.isEmpty()) {
-									Toast.makeText(
-										this@MainActivity,
-										"No rows found in Excel file",
-										Toast.LENGTH_LONG
-									).show()
-									return@withContext
-								}
-								importedStudents = students
-								showImportScreen = true
-							}
-						} catch (e: Exception) {
-							withContext(Dispatchers.Main) {
-								Toast.makeText(
-									this@MainActivity,
-									"Failed to import: ${e.message ?: "Unknown error"}",
-									Toast.LENGTH_LONG
-								).show()
-							}
-						}
-					}
+			LaunchedEffect(selectedEvent?.eventId) {
+				// Background touch to associate device with the selected event for admin device-wise stats.
+				val eid = selectedEvent?.eventId
+				if (eid != null && eid > 0L) {
+					runCatching { ScannerHelper.checkServer(this@MainActivity, eid) }
 				}
 			}
 
 			MaterialTheme {
 				Surface(color = MaterialTheme.colorScheme.background) {
 					when {
-						showImportScreen -> {
-							ImportPreviewScreen(
-								students = importedStudents,
-								onBack = {
-									showImportScreen = false
-									importedStudents = emptyList()
-								},
-								onConfirm = { validStudents ->
-									importToDatabase(validStudents)
-								}
-							)
-						}
 						showExportScreen -> {
 							ExportScreen(
 								onBack = { showExportScreen = false },
 								onExport = { format, presentOnly ->
-									exportAttendance(format, presentOnly)
-									showExportScreen = false
-								}
-							)
-						}
-						showSearchScreen -> {
-							SearchScreen(
-								onBack = { showSearchScreen = false }
-							)
-						}
-						else -> {
-							HomeScreen(
-								stats = stats,
-								events = events,
-								selectedEvent = selectedEvent,
-								onEventSelected = { option ->
-									attendanceViewModel.setSelectedEvent(option.eventId, option.eventName)
-									attendanceViewModel.refreshStats()
-									Toast.makeText(this@MainActivity, "Selected ${option.eventName}", Toast.LENGTH_SHORT).show()
-								},
-								onScanClick = {
-									val current = attendanceViewModel.selectedEvent.value
-									if (current == null) {
-										Toast.makeText(this@MainActivity, "Select an event first", Toast.LENGTH_SHORT).show()
-										return@HomeScreen
-									}
-									val intent = Intent(this@MainActivity, BarcodeScannerActivity::class.java)
-									intent.putExtra(BarcodeScannerActivity.EXTRA_EVENT_ID, current.eventId)
-									intent.putExtra(BarcodeScannerActivity.EXTRA_EVENT_NAME, current.eventName)
-									scannerLauncher.launch(intent)
-								},
-								onSearchClick = {
-									showSearchScreen = true
-								},
-								onImportClick = {
-									filePicker.launch(arrayOf(
-										"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-									))
-								},
-								onExportClick = {
-									showExportScreen = true
-								},
-								onResetClick = {
-									val name = selectedEvent?.eventName ?: "this event"
-									resetMessage = "Clear all students and attendance for $name? This cannot be undone."
-									showResetDialog = true
-								},
-								serverLabel = ServerConfig.displayHost(),
-								onServerSettingsClick = { showServerDialog = true },
-								onTestServerClick = {
-									if (testingServer) return@HomeScreen
-									testingServer = true
-									lifecycleScope.launch(Dispatchers.IO) {
-										val ok = ScannerHelper.checkServer()
-										withContext(Dispatchers.Main) {
-											testingServer = false
-											val msg = if (ok) "Server reachable" else "Server unreachable"
-											Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
-										}
-									}
-								}
-							)
-						}
+								exportAttendance(format, presentOnly)
+							}
+						)
 					}
-
-					if (showResetDialog) {
-						AlertDialog(
-							onDismissRequest = {
-								showResetDialog = false
-							},
-							title = { Text("Reset data?") },
-							text = { Text(resetMessage) },
-							confirmButton = {
-								TextButton(onClick = {
-									performReset()
-								}) {
-									Text("Clear data")
+					showSearchScreen -> {
+						SearchScreen(onBack = { showSearchScreen = false })
+					}
+					else -> {
+						HomeScreen(
+							stats = stats,
+							selectedEvent = selectedEvent,
+							openSession = openSession,
+							onScanClick = {
+								val current = attendanceViewModel.selectedEvent.value
+								if (current == null) {
+									Toast.makeText(this@MainActivity, "No active event", Toast.LENGTH_SHORT).show()
+									return@HomeScreen
 								}
+								val intent = Intent(this@MainActivity, BarcodeScannerActivity::class.java)
+								intent.putExtra(BarcodeScannerActivity.EXTRA_EVENT_ID, current.eventId)
+								intent.putExtra(BarcodeScannerActivity.EXTRA_EVENT_NAME, current.eventName)
+								scannerLauncher.launch(intent)
 							},
-							dismissButton = {
-								TextButton(onClick = {
-									showResetDialog = false
-								}) {
-									Text("Cancel")
+							onSearchClick = { showSearchScreen = true },
+							onExportClick = { showExportScreen = true },
+							onOpenServerSettings = {
+								serverUrl = ServerConfig.getBaseUrl()
+								showServerDialog = true
+							},
+							connectionHint = if (events.isEmpty()) {
+								vmError ?: "No events loaded. Long-press the footer to set the Server URL to Render."
+							} else {
+								null
+							},
+							serverStatusText = if (checkingServer) "Checking..." else serverStatusText,
+							onCheckServer = {
+								if (checkingServer) return@HomeScreen
+								checkingServer = true
+								lifecycleScope.launch(Dispatchers.IO) {
+									val ok = ScannerHelper.checkServer(this@MainActivity, selectedEvent?.eventId)
+									withContext(Dispatchers.Main) {
+										serverStatusText = if (ok) "Online" else "Offline"
+										checkingServer = false
+										Toast.makeText(
+											this@MainActivity,
+											if (ok) "Connected to server" else "Not connected to server",
+											Toast.LENGTH_SHORT
+										).show()
+									}
 								}
 							}
 						)
+					}
 					}
 
 					if (showServerDialog) {
@@ -237,6 +166,11 @@ class MainActivity : ComponentActivity() {
 								serverUrl = normalized
 								Toast.makeText(this@MainActivity, "Server set to ${ServerConfig.displayHost()}", Toast.LENGTH_SHORT).show()
 								showServerDialog = false
+								// Refresh data immediately using the new base URL.
+								attendanceViewModel.refreshEvents()
+								attendanceViewModel.refreshStats()
+								// Kick a one-time sync in case there is pending offline work.
+								SyncWork.enqueueOneTime(this@MainActivity)
 							}
 						)
 					}
@@ -247,55 +181,10 @@ class MainActivity : ComponentActivity() {
 
 	override fun onResume() {
 		super.onResume()
+		SyncWork.enqueuePeriodic(this)
+		SyncWork.enqueueOneTime(this)
 		if (::attendanceViewModel.isInitialized) {
 			attendanceViewModel.refreshStats()
-		}
-	}
-
-	private fun importToDatabase(students: List<StudentImportRow>) {
-		lifecycleScope.launch(Dispatchers.IO) {
-			try {
-				val selected = attendanceViewModel.selectedEvent.value
-				if (selected == null) {
-					withContext(Dispatchers.Main) {
-						Toast.makeText(this@MainActivity, "Select an event first", Toast.LENGTH_SHORT).show()
-					}
-					return@launch
-				}
-
-				val entities = students.map {
-					StudentEntity(
-						eventId = selected.eventId,
-						uid = it.uid.trim(),
-						name = it.name,
-						branch = it.branch,
-						year = it.year,
-						status = "Absent",
-						timestamp = ""
-					)
-				}
-
-				database.studentDao().insertAll(entities)
-
-				withContext(Dispatchers.Main) {
-					Toast.makeText(
-						this@MainActivity,
-						"✅ ${entities.size} students imported successfully!",
-						Toast.LENGTH_LONG
-					).show()
-					showImportScreen = false
-					importedStudents = emptyList()
-					attendanceViewModel.refreshStats()
-				}
-			} catch (e: Exception) {
-				withContext(Dispatchers.Main) {
-					Toast.makeText(
-						this@MainActivity,
-						"Import failed: ${e.message}",
-						Toast.LENGTH_LONG
-					).show()
-				}
-			}
 		}
 	}
 
@@ -352,19 +241,6 @@ class MainActivity : ComponentActivity() {
 				}
 			}
 		}
-	}
-
-	private fun performReset() {
-		showResetDialog = false
-		attendanceViewModel.resetAllData(
-			onComplete = {
-				val name = attendanceViewModel.selectedEvent.value?.eventName ?: "event"
-				Toast.makeText(this, "Data cleared for $name. Import a new list to start fresh.", Toast.LENGTH_LONG).show()
-			},
-			onError = { msg ->
-				Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-			}
-		)
 	}
 
 	private fun timeStamp(): String = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())

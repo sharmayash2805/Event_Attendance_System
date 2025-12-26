@@ -18,6 +18,9 @@
     .muted { color: #6b7280; font-size: 13px; }
     .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; border: 1px solid #e5e7eb; font-size: 12px; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .danger { background: #dc2626; color: white; border: 0; border-radius: 10px; }
+    .danger:disabled { opacity: 0.65; cursor: not-allowed; }
+    .preview { border: 1px dashed #e5e7eb; border-radius: 12px; padding: 10px; }
     a { color: inherit; }
   </style>
 </head>
@@ -43,9 +46,66 @@
         {% endfor %}
       </select>
 
+      <div class="muted" style="margin-top: 8px;">
+        Scanning is using: <b id="scanningEvent">-</b> · <b id="scanningSession">-</b>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <label for="sessionSelect">Selected session</label>
+        <select id="sessionSelect">
+          {% for s in sessions %}
+            <option value="{{ s.session_id }}" {% if active_session and s.session_id == active_session.session_id %}selected{% endif %}>
+              #{{ s.session_id }} · {{ s.session_name }}{% if s.is_active %} (open){% endif %}
+            </option>
+          {% endfor %}
+        </select>
+        <div class="muted" style="margin-top: 6px;">Selecting a session is view-only; scans always go to the open session. Creating a new session resets attendance.</div>
+      </div>
+
       <div class="actions" style="margin-top: 10px;">
         <a id="downloadAll" href="#" class="pill">Download Full List</a>
         <a id="downloadPresent" href="#" class="pill">Download Present Only</a>
+      </div>
+
+      <div class="actions" style="margin-top: 10px;">
+        <form method="post" action="/admin/events/{{ selected_event_id }}/sessions/create" class="row" style="gap: 8px; margin: 0; flex: 1 1 auto; align-items: flex-end;">
+          <div style="flex: 1 1 220px;">
+            <label>New session name</label>
+            <input name="session_name" placeholder="e.g. Session 2" />
+          </div>
+          <div style="flex: 0 0 auto;">
+            <label>&nbsp;</label>
+            <button type="submit">Create & Open Session</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="actions" style="margin-top: 10px; align-items: center;">
+        <input id="importFile" type="file" accept=".xlsx" style="display:none" />
+        <button id="importBtn" type="button" class="danger">Import Excel Sheet</button>
+        <span id="importStatus" class="muted"></span>
+      </div>
+      <div class="muted" style="margin-top: 8px;">Excel columns: UID, Name, Branch, Year</div>
+
+      <div id="importPreviewWrap" class="preview" style="margin-top: 10px; display:none;">
+        <div class="row" style="align-items: center; justify-content: space-between;">
+          <b>Confirm import</b>
+          <button id="confirmImportBtn" type="button">Confirm & Import</button>
+        </div>
+        <div class="muted" style="margin-top: 6px;">Students in the selected Excel sheet: <b id="importCount">0</b></div>
+        <div style="max-height: 220px; overflow: auto; margin-top: 10px;">
+          <table>
+            <thead>
+              <tr>
+                <th>UID</th>
+                <th>Name</th>
+                <th>Branch</th>
+                <th>Year</th>
+              </tr>
+            </thead>
+            <tbody id="importPreviewBody"></tbody>
+          </table>
+        </div>
       </div>
 
       <div class="actions" style="margin-top: 10px;">
@@ -71,7 +131,7 @@
 
   <div class="card" style="margin-top: 12px;">
     <b>Live attendance</b>
-    <div class="muted" style="margin-top: 6px;">Showing roster with per-event status.</div>
+    <div class="muted" style="margin-top: 6px;">Showing only marked attendance (no pre-event roster).</div>
 
     <div style="max-height: 60vh; overflow: auto; margin-top: 10px;">
       <table>
@@ -127,7 +187,10 @@
     const POLL_MS = 5000;
 
     const eventSelect = document.getElementById('eventSelect');
+    const sessionSelect = document.getElementById('sessionSelect');
     const serverTime = document.getElementById('serverTime');
+    const scanningEvent = document.getElementById('scanningEvent');
+    const scanningSession = document.getElementById('scanningSession');
 
     const totalEl = document.getElementById('total');
     const presentEl = document.getElementById('present');
@@ -140,6 +203,16 @@
     const downloadAll = document.getElementById('downloadAll');
     const downloadPresent = document.getElementById('downloadPresent');
 
+    const importBtn = document.getElementById('importBtn');
+    const importFile = document.getElementById('importFile');
+    const importStatus = document.getElementById('importStatus');
+    const importPreviewWrap = document.getElementById('importPreviewWrap');
+    const importPreviewBody = document.getElementById('importPreviewBody');
+    const importCount = document.getElementById('importCount');
+    const confirmImportBtn = document.getElementById('confirmImportBtn');
+
+    let pendingImportToken = '';
+
     const closeBtn = document.getElementById('closeBtn');
     const openBtn = document.getElementById('openBtn');
 
@@ -147,10 +220,87 @@
       return eventSelect.value;
     }
 
+    function currentSessionId() {
+      return sessionSelect ? sessionSelect.value : '';
+    }
+
+    async function refreshSessions() {
+      const eid = currentEventId();
+      if (!sessionSelect) return;
+      const previouslySelected = currentSessionId();
+      const res = await fetch(`/admin/api/sessions?event_id=${encodeURIComponent(eid)}`, { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      const sessions = data.sessions || [];
+      const active = data.active || null;
+
+      sessionSelect.innerHTML = sessions
+        .map(s => {
+          const open = s.is_active ? ' (open)' : '';
+          const selected = previouslySelected
+            ? (String(previouslySelected) === String(s.session_id) ? ' selected' : '')
+            : (active && String(active.session_id) === String(s.session_id) ? ' selected' : '');
+          return `<option value="${escapeHtml(s.session_id)}"${selected}>#${escapeHtml(s.session_id)} · ${escapeHtml(s.session_name)}${open}</option>`;
+        })
+        .join('');
+
+      updateLinksAndActions();
+
+      updateLinksAndActions();
+    }
+
+    async function refreshScanningState() {
+      try {
+        const er = await fetch('/events?active=1', { cache: 'no-store' });
+        if (!er.ok) {
+          scanningEvent.textContent = '-';
+          scanningSession.textContent = '-';
+          return;
+        }
+        const activeEvents = await er.json().catch(() => []);
+        const activeEvent = Array.isArray(activeEvents) && activeEvents.length ? activeEvents[0] : null;
+        if (!activeEvent) {
+          scanningEvent.textContent = 'No active event';
+          scanningSession.textContent = 'No open session';
+          return;
+        }
+
+        const eid = String(activeEvent.event_id ?? '');
+        const name = String(activeEvent.event_name ?? '').trim();
+        scanningEvent.textContent = eid ? `#${eid} · ${name || 'Event'}` : (name || 'Event');
+
+        const sr = await fetch(`/admin/api/sessions?event_id=${encodeURIComponent(eid)}`, { cache: 'no-store' });
+        if (sr.status === 401) {
+          location.href = '/admin/login';
+          return;
+        }
+        if (!sr.ok) {
+          scanningSession.textContent = 'No open session';
+          return;
+        }
+        const sdata = await sr.json().catch(() => ({}));
+        const active = sdata.active || null;
+        if (!active) {
+          scanningSession.textContent = 'No open session';
+          return;
+        }
+        const sid = String(active.session_id ?? '');
+        const sname = String(active.session_name ?? '').trim();
+        scanningSession.textContent = sid ? `#${sid} · ${sname || 'Session'} (open)` : `${sname || 'Session'} (open)`;
+      } catch {
+        scanningEvent.textContent = '-';
+        scanningSession.textContent = '-';
+      }
+    }
+
     function updateLinksAndActions() {
       const eid = currentEventId();
-      downloadAll.href = `/export?present_only=0&event_id=${encodeURIComponent(eid)}`;
-      downloadPresent.href = `/export?present_only=1&event_id=${encodeURIComponent(eid)}`;
+      const sid = currentSessionId();
+      const base = new URLSearchParams({ present_only: '0', event_id: String(eid) });
+      if (sid) base.set('session_id', String(sid));
+      downloadAll.href = `/export?${base.toString()}`;
+      base.set('present_only', '1');
+      downloadPresent.href = `/export?${base.toString()}`;
 
       closeBtn.onclick = () => {
         fetch(`/admin/events/${encodeURIComponent(eid)}/close`, { method: 'POST' }).then(() => location.reload());
@@ -159,6 +309,117 @@
         fetch(`/admin/events/${encodeURIComponent(eid)}/open`, { method: 'POST' }).then(() => location.reload());
       };
     }
+
+    function setImportStatus(text, isError) {
+      importStatus.textContent = text || '';
+      importStatus.style.color = isError ? '#b91c1c' : '';
+    }
+
+    function clearPreview() {
+      pendingImportToken = '';
+      importPreviewWrap.style.display = 'none';
+      importPreviewBody.innerHTML = '';
+      importCount.textContent = '0';
+      confirmImportBtn.disabled = true;
+    }
+
+    function renderImportPreview(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        clearPreview();
+        setImportStatus('No valid rows found (UID and Name required).', true);
+        return;
+      }
+      importCount.textContent = String(rows.length);
+      importPreviewBody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${escapeHtml(r.uid || '')}</td>
+          <td>${escapeHtml(r.name || '')}</td>
+          <td>${escapeHtml(r.branch || '')}</td>
+          <td>${escapeHtml(r.year || '')}</td>
+        </tr>
+      `).join('');
+      importPreviewWrap.style.display = '';
+      confirmImportBtn.disabled = false;
+    }
+
+    importBtn.addEventListener('click', () => {
+      setImportStatus('', false);
+      importFile.value = '';
+      clearPreview();
+      importFile.click();
+    });
+
+    importFile.addEventListener('change', async () => {
+      const file = importFile.files && importFile.files[0];
+      if (!file) return;
+
+      importBtn.disabled = true;
+      setImportStatus('Uploading for preview…', false);
+
+      try {
+        const fd = new FormData();
+        fd.append('event_id', currentEventId());
+        fd.append('file', file);
+
+        const res = await fetch('/admin/api/import/preview', { method: 'POST', body: fd });
+        if (res.status === 401) {
+          location.href = '/admin/login';
+          return;
+        }
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setImportStatus(data.error || `Import failed (${res.status})`, true);
+          return;
+        }
+
+        pendingImportToken = data.token || '';
+        setImportStatus('Preview loaded. Click “Confirm & Import”.', false);
+        renderImportPreview(data.rows || []);
+      } catch (e) {
+        setImportStatus(`Import failed: ${e}`, true);
+      } finally {
+        importBtn.disabled = false;
+      }
+    });
+
+    confirmImportBtn.addEventListener('click', async () => {
+      if (!pendingImportToken) {
+        setImportStatus('Please upload an Excel file first.', true);
+        return;
+      }
+
+      confirmImportBtn.disabled = true;
+      importBtn.disabled = true;
+      setImportStatus('Importing…', false);
+
+      try {
+        const fd = new FormData();
+        fd.append('event_id', currentEventId());
+        fd.append('token', pendingImportToken);
+
+        const res = await fetch('/admin/api/import/confirm', { method: 'POST', body: fd });
+        if (res.status === 401) {
+          location.href = '/admin/login';
+          return;
+        }
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setImportStatus(data.error || `Import failed (${res.status})`, true);
+          return;
+        }
+
+        setImportStatus(`Imported ${data.imported ?? 0} students.`, false);
+        clearPreview();
+        pollOnce();
+      } catch (e) {
+        setImportStatus(`Import failed: ${e}`, true);
+      } finally {
+        importBtn.disabled = false;
+        confirmImportBtn.disabled = false;
+      }
+    });
 
     function escapeHtml(s) {
       return String(s)
@@ -175,7 +436,14 @@
         return;
       }
       deviceStatsEl.innerHTML = list
-        .map(d => `${escapeHtml(d.device_id)}: <b>${escapeHtml(d.present_count)}</b>`)
+        .map(d => {
+          const state = d.online ? 'ONLINE' : 'OFFLINE';
+          const lastSeen = d.last_seen || '';
+          const ip = d.last_ip || '';
+          return `${escapeHtml(d.device_id)} <span class="pill">${escapeHtml(state)}</span> · Present: <b>${escapeHtml(d.present_count)}</b>`
+            + (lastSeen ? ` · Last seen: ${escapeHtml(lastSeen)}` : '')
+            + (ip ? ` · IP: ${escapeHtml(ip)}` : '');
+        })
         .join('<br/>');
     }
 
@@ -204,7 +472,10 @@
 
     async function pollOnce() {
       const eid = currentEventId();
-      const res = await fetch(`/admin/api/dashboard?event_id=${encodeURIComponent(eid)}`, { cache: 'no-store' });
+      const sid = currentSessionId();
+      const qs = new URLSearchParams({ event_id: String(eid) });
+      if (sid) qs.set('session_id', String(sid));
+      const res = await fetch(`/admin/api/dashboard?${qs.toString()}`, { cache: 'no-store' });
       if (res.status === 401) {
         location.href = '/admin/login';
         return;
@@ -224,12 +495,24 @@
 
     eventSelect.addEventListener('change', () => {
       updateLinksAndActions();
+      refreshSessions();
+      refreshScanningState();
       pollOnce();
     });
 
+    if (sessionSelect) {
+      sessionSelect.addEventListener('change', () => {
+        updateLinksAndActions();
+        pollOnce();
+      });
+    }
+
     updateLinksAndActions();
+    refreshSessions();
+    refreshScanningState();
     pollOnce();
     setInterval(pollOnce, POLL_MS);
+    setInterval(refreshScanningState, POLL_MS);
   </script>
 </body>
 </html>

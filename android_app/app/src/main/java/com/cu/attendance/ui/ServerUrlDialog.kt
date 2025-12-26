@@ -30,7 +30,10 @@ fun ServerUrlDialog(
         title = { Text("Server Address") },
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
-                Text("Enter http://<ip>:5000 for your Flask server.")
+                Text("Enter your server base URL (LAN or Render).")
+                Text("Examples:")
+                Text("- http://192.168.1.39:5000")
+                Text("- https://event-attendance-system-fslz.onrender.com")
                 OutlinedTextField(
                     value = value,
                     onValueChange = { value = it },
@@ -38,7 +41,7 @@ fun ServerUrlDialog(
                         .fillMaxWidth()
                         .padding(top = 12.dp),
                     singleLine = true,
-                    placeholder = { Text("http://192.168.1.39:5000") }
+                    placeholder = { Text("https://event-attendance-system-fslz.onrender.com") }
                 )
             }
         },

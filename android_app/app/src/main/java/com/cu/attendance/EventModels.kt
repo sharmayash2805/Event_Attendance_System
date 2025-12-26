@@ -12,3 +12,10 @@ data class SelectedEvent(
 	val eventId: Long,
 	val eventName: String
 )
+
+
+data class SessionDto(
+	val sessionId: Long,
+	val sessionName: String,
+	val isOpen: Boolean = true
+)

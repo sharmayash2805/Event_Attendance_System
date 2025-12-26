@@ -12,9 +12,10 @@ object ApiClient {
 
 	val client: OkHttpClient by lazy {
 		OkHttpClient.Builder()
-			.connectTimeout(3, TimeUnit.SECONDS)
-			.readTimeout(5, TimeUnit.SECONDS)
-			.writeTimeout(5, TimeUnit.SECONDS)
+			// Render (and similar hosts) can cold-start and exceed a few seconds.
+			.connectTimeout(10, TimeUnit.SECONDS)
+			.readTimeout(20, TimeUnit.SECONDS)
+			.writeTimeout(20, TimeUnit.SECONDS)
 			.build()
 	}
 

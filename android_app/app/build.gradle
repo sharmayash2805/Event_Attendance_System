@@ -66,6 +66,9 @@ dependencies {
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.2'
     implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.6.2'
 
+    // Background sync
+    implementation 'androidx.work:work-runtime-ktx:2.9.0'
+
     // Coroutines
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 
@@ -83,16 +86,6 @@ dependencies {
 
     // Networking
     implementation 'com.squareup.okhttp3:okhttp:4.11.0'
-
-    // Excel (Apache POI) without Log4j (avoids MethodHandle API 26 requirement)
-    implementation('org.apache.poi:poi-ooxml:5.2.5') {
-        exclude group: 'org.apache.logging.log4j', module: 'log4j-api'
-        exclude group: 'org.apache.logging.log4j', module: 'log4j-core'
-        exclude group: 'commons-logging', module: 'commons-logging'
-    }
-    // POI still references LogManager from log4j-api; provide the API jar with no-op slf4j
-    implementation 'org.apache.logging.log4j:log4j-api:2.20.0'
-    implementation 'org.slf4j:slf4j-nop:1.7.36'
 
     // Kotlin stdlib
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.20'

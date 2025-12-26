@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -55,8 +56,39 @@ object ScannerHelper {
                         val reverted = db.studentDao().getStudentByUid(eventId, normalizedUid)
                         withContext(Dispatchers.Main) { callback.onResult("INVALID", reverted) }
                     } else {
-                        // Network or other server error: fall back to local result.
-                        withContext(Dispatchers.Main) { callback.onResult(localResult.first, localResult.second) }
+
+                        // Network or other server error: if we optimistically marked Present locally,
+                        // queue a sync retry and report QUEUED to the UI.
+                        if (localResult.first == "SUCCESS" && localResult.second != null) {
+                            val exists = db.offlineQueueDao().findExistingId(
+                                action = "MARK_PRESENT",
+                                eventId = eventId,
+                                uid = normalizedUid
+                            )
+                            if (exists == null) {
+                                val payload = JSONObject()
+                                    .put("device_timestamp", localTimestamp)
+                                    .toString()
+                                db.offlineQueueDao().enqueue(
+                                    OfflineQueueEntity(
+                                        action = "MARK_PRESENT",
+                                        uid = normalizedUid,
+                                        eventId = eventId,
+                                        payload = payload
+                                    )
+                                )
+                            }
+
+                            // IMPORTANT: keep local state honest. If it's not yet confirmed by server,
+                            // mark it as QUEUED (not Present) so counts/exports don't imply sync.
+                            db.studentDao().updateStatus(eventId, normalizedUid, "Queued", localTimestamp)
+                            val queuedStudent = db.studentDao().getStudentByUid(eventId, normalizedUid)
+                            SyncWork.enqueueOneTime(context)
+                            withContext(Dispatchers.Main) { callback.onResult("QUEUED", queuedStudent ?: localResult.second) }
+                        } else {
+                            // Otherwise fall back to local result.
+                            withContext(Dispatchers.Main) { callback.onResult(localResult.first, localResult.second) }
+                        }
                     }
                 }
             }
@@ -72,6 +104,12 @@ object ScannerHelper {
         }
     }
 
+    suspend fun checkServer(context: Context, eventId: Long? = null): Boolean {
+        val deviceId = DeviceIdProvider.getOrCreate(context)
+        return ApiService.ping(eventId = eventId, deviceId = deviceId)
+    }
+
+    // Backwards compatible (no device tracking).
     suspend fun checkServer(): Boolean = ApiService.ping()
 
     private suspend fun processOffline(db: AppDatabase, eventId: Long, uid: String): Pair<String, StudentEntity?> {

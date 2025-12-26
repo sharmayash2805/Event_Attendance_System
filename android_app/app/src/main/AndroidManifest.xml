@@ -3,6 +3,7 @@
 
 	<uses-permission android:name="android.permission.CAMERA" />
 	<uses-permission android:name="android.permission.INTERNET" />
+	<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
 	<!-- Camera is used but not required on ChromeOS/large-screen devices -->
 	<uses-feature
@@ -10,6 +11,7 @@
 		android:required="false" />
 
 	<application
+		android:name=".AttendanceApp"
 		android:allowBackup="true"
 		android:label="Attendance"
 		android:icon="@mipmap/ic_launcher"

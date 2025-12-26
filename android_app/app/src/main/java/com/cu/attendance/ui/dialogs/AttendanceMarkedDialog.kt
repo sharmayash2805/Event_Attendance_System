@@ -28,6 +28,7 @@ fun AttendanceMarkedDialog(
     uid: String,
     name: String,
     time: String,
+	syncStatus: String,
     onDismiss: () -> Unit
 ) {
     Dialog(onDismissRequest = onDismiss) {
@@ -59,6 +60,8 @@ fun AttendanceMarkedDialog(
                 InfoRow(label = "Name", value = name)
 
                 InfoRow(label = "Time", value = time)
+
+				InfoRow(label = "Sync", value = syncStatus)
 
                 Spacer(modifier = Modifier.height(12.dp))
 

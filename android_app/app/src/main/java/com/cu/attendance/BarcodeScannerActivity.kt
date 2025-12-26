@@ -125,10 +125,11 @@ class BarcodeScannerActivity : ComponentActivity() {
             var scannedUid by remember { mutableStateOf("") }
             var alreadyMarkedResult by remember { mutableStateOf<AlreadyMarkedResult?>(null) }
             var markedResult by remember { mutableStateOf<AlreadyMarkedResult?>(null) }
+			var markedSyncStatus by remember { mutableStateOf("Synced") }
 
             LaunchedEffect(Unit) {
                 while (true) {
-                    serverOnline = ScannerHelper.checkServer()
+                    serverOnline = ScannerHelper.checkServer(this@BarcodeScannerActivity, eventId)
                     kotlinx.coroutines.delay(5000)
                 }
             }
@@ -165,8 +166,20 @@ class BarcodeScannerActivity : ComponentActivity() {
                                         name = displayName,
                                         time = displayTime
                                     )
+                                markedSyncStatus = "Synced"
                                     showMarkedDialog = true
                                 }
+							"QUEUED" -> {
+								val displayName = student?.name?.ifBlank { uid } ?: uid
+								val displayTime = student?.timestamp?.ifBlank { nowString() } ?: nowString()
+								markedResult = AlreadyMarkedResult(
+									uid = student?.uid ?: uid,
+									name = displayName,
+									time = displayTime
+								)
+                                markedSyncStatus = "Queued"
+								showMarkedDialog = true
+							}
                                 else -> {
                                     Toast.makeText(this@BarcodeScannerActivity, "Error processing scan", Toast.LENGTH_SHORT).show()
                                     resetScanState()
@@ -256,6 +269,7 @@ class BarcodeScannerActivity : ComponentActivity() {
                     uid = markedResult!!.uid,
                     name = markedResult!!.name,
                     time = markedResult!!.time,
+					syncStatus = markedSyncStatus,
                     onDismiss = {
                         showMarkedDialog = false
                         markedResult = null

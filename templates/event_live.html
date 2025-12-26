@@ -18,6 +18,10 @@
     .stat b { font-size: 22px; }
     .pulse { transition: transform 240ms ease, opacity 240ms ease; }
     .pulse.bump { transform: scale(1.04); opacity: 1; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid rgba(229,231,235,0.14); padding: 10px 8px; text-align: left; font-size: 13px; }
+    th { color: #9ca3af; font-weight: 600; position: sticky; top: 0; background: rgba(11,18,32,0.92); }
   </style>
 </head>
 <body>
@@ -49,6 +53,29 @@
         </div>
       </div>
     </div>
+
+    <div class="card">
+      <div class="sub">Live marked attendance (latest first)</div>
+      <div style="max-height: 55vh; overflow: auto; margin-top: 12px;">
+        <table>
+          <thead>
+            <tr>
+              <th>UID</th>
+              <th>Name</th>
+              <th>Branch</th>
+              <th>Year</th>
+              <th>Status</th>
+              <th>Time</th>
+              <th>Source</th>
+              <th>Device</th>
+            </tr>
+          </thead>
+          <tbody id="attendanceBody">
+            <tr><td colspan="8" class="sub">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -60,6 +87,7 @@
     const remainingEl = document.getElementById('remaining');
     const activeEl = document.getElementById('active');
     const serverTimeEl = document.getElementById('serverTime');
+    const attendanceBody = document.getElementById('attendanceBody');
 
     let lastPresent = null;
 
@@ -68,6 +96,37 @@
       // Force reflow
       void el.offsetWidth;
       el.classList.add('bump');
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    function renderAttendance(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        attendanceBody.innerHTML = `<tr><td colspan="8" class="sub">No marked rows yet.</td></tr>`;
+        return;
+      }
+
+      attendanceBody.innerHTML = rows.map(r => {
+        return `
+          <tr>
+            <td>${escapeHtml(r.uid || '')}</td>
+            <td>${escapeHtml(r.name || '')}</td>
+            <td>${escapeHtml(r.branch || '')}</td>
+            <td>${escapeHtml(r.year || '')}</td>
+            <td>${escapeHtml(r.status || '')}</td>
+            <td>${escapeHtml(r.timestamp || '')}</td>
+            <td>${escapeHtml(r.source || '')}</td>
+            <td>${escapeHtml(r.device_id || '')}</td>
+          </tr>
+        `;
+      }).join('');
     }
 
     async function pollOnce() {
@@ -91,6 +150,8 @@
       remainingEl.textContent = remaining;
       activeEl.textContent = data.event?.is_active ? 'Active' : 'Closed';
       serverTimeEl.textContent = data.server_time || '-';
+
+      renderAttendance(data.attendance);
     }
 
     pollOnce();

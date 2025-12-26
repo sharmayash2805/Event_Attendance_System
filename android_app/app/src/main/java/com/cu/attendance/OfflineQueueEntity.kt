@@ -5,7 +5,7 @@ import androidx.room.PrimaryKey
 
 /**
  * Represents a pending action that must be synced when online.
- * Example actions: MARK_PRESENT, INSERT_STUDENT, UPDATE_STUDENT.
+ * Example actions: MARK_PRESENT, ADD_STUDENT (aka INSERT_STUDENT).
  */
 @Entity(tableName = "offline_queue")
 data class OfflineQueueEntity(

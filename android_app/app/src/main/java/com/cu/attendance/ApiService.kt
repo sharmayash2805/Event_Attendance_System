@@ -24,10 +24,22 @@ sealed class MarkResult {
 object ApiService {
 	private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-	suspend fun ping(): Boolean = withContext(Dispatchers.IO) {
+	private fun statsUrl(eventId: Long? = null, deviceId: String? = null): String {
+		val params = mutableListOf<String>()
+		if (eventId != null && eventId > 0L) params += "event_id=$eventId"
+		val did = deviceId?.trim().orEmpty()
+		if (did.isNotEmpty()) {
+			val encoded = java.net.URLEncoder.encode(did, "UTF-8")
+			params += "device_id=$encoded"
+		}
+		val query = if (params.isEmpty()) "" else "?" + params.joinToString("&")
+		return ApiClient.url("/stats$query")
+	}
+
+	suspend fun ping(eventId: Long? = null, deviceId: String? = null): Boolean = withContext(Dispatchers.IO) {
 		try {
 			val request = Request.Builder()
-				.url(ApiClient.url("/stats"))
+				.url(statsUrl(eventId = eventId, deviceId = deviceId))
 				.get()
 				.build()
 			ApiClient.client.newCall(request).execute().use { response ->
@@ -66,6 +78,28 @@ object ApiService {
 			}
 		} catch (_: Exception) {
 			emptyList()
+		}
+	}
+
+	suspend fun fetchOpenSession(eventId: Long): SessionDto? = withContext(Dispatchers.IO) {
+		try {
+			val request = Request.Builder()
+				.url(ApiClient.url("/api/event/$eventId/session"))
+				.get()
+				.build()
+			ApiClient.client.newCall(request).execute().use { response ->
+				val bodyText = response.body?.string().orEmpty()
+				if (!response.isSuccessful) return@withContext null
+				val json = JSONObject(bodyText)
+				if (json.has("error")) return@withContext null
+				return@withContext SessionDto(
+					sessionId = json.optLong("session_id", 0L),
+					sessionName = json.optString("session_name", ""),
+					isOpen = json.optBoolean("is_open", true)
+				)
+			}
+		} catch (_: Exception) {
+			null
 		}
 	}
 
@@ -204,11 +238,10 @@ object ApiService {
 		}
 	}
 
-	suspend fun fetchStats(eventId: Long? = null): StatsResponse? = withContext(Dispatchers.IO) {
+	suspend fun fetchStats(eventId: Long? = null, deviceId: String? = null): StatsResponse? = withContext(Dispatchers.IO) {
 		try {
-			val query = if (eventId != null && eventId > 0L) "?event_id=$eventId" else ""
 			val request = Request.Builder()
-				.url(ApiClient.url("/stats$query"))
+				.url(statsUrl(eventId = eventId, deviceId = deviceId))
 				.get()
 				.build()
 

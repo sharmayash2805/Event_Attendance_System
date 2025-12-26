@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -31,6 +32,9 @@ class AttendanceViewModel(application: Application) : AndroidViewModel(applicati
     private val _stats = MutableStateFlow(AttendanceStats())
     val stats: StateFlow<AttendanceStats> = _stats.asStateFlow()
 
+	private val _openSession = MutableStateFlow<SessionDto?>(null)
+	val openSession: StateFlow<SessionDto?> = _openSession.asStateFlow()
+
     private val _searchResults = MutableStateFlow<List<StudentEntity>>(emptyList())
     val searchResults: StateFlow<List<StudentEntity>> = _searchResults.asStateFlow()
 
@@ -44,6 +48,7 @@ class AttendanceViewModel(application: Application) : AndroidViewModel(applicati
     val error: StateFlow<String?> = _error.asStateFlow()
 
     init {
+		ServerConfig.load(getApplication())
         refreshEvents()
         refreshStats()
     }
@@ -54,16 +59,50 @@ class AttendanceViewModel(application: Application) : AndroidViewModel(applicati
         _selectedEvent.value = next
         EventPrefs.saveSelectedEvent(getApplication(), next)
         refreshStats()
+        refreshOpenSession()
         clearSearchResults()
         clearError()
     }
 
+    private fun refreshOpenSession() {
+        viewModelScope.launch {
+            val eventId = _selectedEvent.value?.eventId
+            if (eventId == null || eventId <= 0L) {
+                _openSession.value = null
+                return@launch
+            }
+            val session = ApiService.fetchOpenSession(eventId)
+            _openSession.value = session
+        }
+    }
+
     fun refreshEvents() {
         viewModelScope.launch {
-            val fetched = ApiService.fetchEvents(activeOnly = true)
-            if (fetched.isNotEmpty()) {
-                _events.value = fetched
+            val active = ApiService.fetchEvents(activeOnly = true)
+            if (active.isNotEmpty()) {
+                _events.value = active
+				_error.value = null
+				// Auto-select the first active event (no dropdown on Home screen).
+				val first = active.firstOrNull()
+				if (first != null) {
+					setSelectedEvent(first.eventId, first.eventName)
+				}
+                return@launch
             }
+
+            // Fallback: if no active events exist (or they were all closed), still show events
+            // so the operator can pick the correct one (scanner will still be blocked server-side
+            // if the event is closed).
+            val all = ApiService.fetchEvents(activeOnly = false)
+            if (all.isNotEmpty()) {
+                _events.value = all
+				_error.value = null
+				// No active event; keep whatever was last selected (scanner may be blocked).
+				return@launch
+            }
+
+			// Still empty: likely not connected / wrong URL / server sleeping.
+			_error.value = "Can't load events. Check Server URL and internet, then tap Server → Check."
         }
     }
 
@@ -238,6 +277,46 @@ class AttendanceViewModel(application: Application) : AndroidViewModel(applicati
 
                 onSuccess(newStudent)
                 refreshStats()
+
+                // Best-effort server sync; queue for background retry on failure.
+                val result = ApiService.addStudent(eventId, normalizedUid, name, branch, year)
+                when (result) {
+                    is MarkResult.Success,
+                    is MarkResult.AlreadyMarked -> {
+                        // If server returns a timestamp, keep local in sync.
+                        val remote = (result as? MarkResult.Success)?.student
+                        if (remote != null && remote.timestamp.isNotBlank()) {
+                            withContext(Dispatchers.IO) {
+                                database.studentDao().insert(remote.copy(eventId = eventId, uid = normalizedUid))
+                            }
+                        }
+                    }
+                    MarkResult.Invalid -> {
+                        // Don't queue invalid requests.
+                    }
+                    is MarkResult.Error -> {
+                        withContext(Dispatchers.IO) {
+                            val action = "ADD_STUDENT"
+                            val exists = database.offlineQueueDao().findExistingId(action, eventId, normalizedUid)
+                            if (exists == null) {
+                                val payload = JSONObject()
+                                    .put("name", name)
+                                    .put("branch", branch)
+                                    .put("year", year)
+                                    .toString()
+                                database.offlineQueueDao().enqueue(
+                                    OfflineQueueEntity(
+                                        action = action,
+                                        uid = normalizedUid,
+                                        eventId = eventId,
+                                        payload = payload
+                                    )
+                                )
+                            }
+                        }
+                        SyncWork.enqueueOneTime(getApplication())
+                    }
+                }
             } catch (e: Exception) {
                 val msg = "Failed to add student: ${e.message}"
                 _error.value = msg
