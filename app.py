@@ -1,16 +1,18 @@
 import io
 import os
 import secrets
-import sqlite3
 from datetime import datetime, timedelta
 from functools import wraps
 
 import pandas as pd
 import re
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from sqlalchemy import and_, or_, func
+from sqlalchemy.exc import IntegrityError
 
+from db_new import engine, SessionLocal, get_db_session, Base
+from models import Event, Student, Device, Session as DBSession, SessionAttendance
 
-DB_PATH = os.environ.get("DB_PATH", "attendance.db")
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -39,113 +41,35 @@ def _parse_dt(s: str) -> datetime | None:
         return None
 
 
-def _db() -> sqlite3.Connection:
-    # Use a timeout and enable WAL for higher-concurrency writes from multiple devices.
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    try:
-        # Enable WAL and adjust synchronous for better write concurrency.
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA busy_timeout=30000;")
-    except Exception:
-        # ignore if pragmas fail on some setups
-        pass
-    return conn
-
-
 def init_db() -> None:
-    with _db() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_name TEXT NOT NULL,
-                start_time TEXT,
-                end_time   TEXT,
-                is_active  INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+    """Create tables using SQLAlchemy ORM. Idempotent."""
+    Base.metadata.create_all(engine)
+    
+    # Ensure at least one event exists (helps older Android migrations that map to eventId=1).
+    db = get_db_session()
+    try:
+        event_count = db.query(func.count(Event.event_id)).scalar()
+        if event_count == 0:
+            default_event = Event(
+                event_name="Default Event",
+                start_time="",
+                end_time="",
+                is_active=1,
+                created_at=_now_str(),
             )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS students (
-                event_id        INTEGER NOT NULL,
-                uid             TEXT NOT NULL,
-                name            TEXT NOT NULL,
-                branch          TEXT,
-                year            TEXT,
-                status          TEXT NOT NULL DEFAULT 'Absent',
-                timestamp       TEXT NOT NULL DEFAULT '',
-                source          TEXT NOT NULL DEFAULT 'Imported',
-                device_id       TEXT NOT NULL DEFAULT '',
-                device_timestamp TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (event_id, uid),
-                FOREIGN KEY (event_id) REFERENCES events(event_id)
+            db.add(default_event)
+            db.flush()
+            
+            default_session = DBSession(
+                event_id=default_event.event_id,
+                session_name="Session 1",
+                is_active=1,
+                created_at=_now_str(),
             )
-            """
-        )
-
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS devices (
-                device_id     TEXT PRIMARY KEY,
-                last_seen     TEXT NOT NULL,
-                last_event_id INTEGER,
-                last_ip       TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id     INTEGER NOT NULL,
-                session_name TEXT NOT NULL,
-                is_active    INTEGER NOT NULL DEFAULT 0,
-                created_at   TEXT NOT NULL,
-                FOREIGN KEY (event_id) REFERENCES events(event_id)
-            )
-            """
-        )
-
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS session_attendance (
-                session_id       INTEGER NOT NULL,
-                event_id         INTEGER NOT NULL,
-                uid              TEXT NOT NULL,
-                timestamp        TEXT NOT NULL,
-                source           TEXT NOT NULL,
-                device_id        TEXT NOT NULL DEFAULT '',
-                device_timestamp TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (session_id, uid),
-                FOREIGN KEY (session_id) REFERENCES sessions(session_id),
-                FOREIGN KEY (event_id) REFERENCES events(event_id)
-            )
-            """
-        )
-        # Indexes to speed up lookups under high load
-        c.execute("CREATE INDEX IF NOT EXISTS idx_session_attendance_event ON session_attendance(event_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_students_event_uid ON students(event_id, uid)")
-        # Ensure at least one event exists (helps older Android local migrations that map to eventId=1).
-        c.execute("SELECT COUNT(*) AS n FROM events")
-        if int(c.fetchone()[0]) == 0:
-            c.execute(
-                "INSERT INTO events (event_name, start_time, end_time, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
-                ("Default Event", "", "", 1, _now_str()),
-            )
-            # Default session for the seeded event.
-            c.execute("SELECT event_id FROM events ORDER BY event_id ASC LIMIT 1")
-            seeded_id = c.fetchone()[0]
-            c.execute(
-                "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, ?, ?)",
-                (int(seeded_id), "Session 1", 1, _now_str()),
-            )
-        conn.commit()
+            db.add(default_session)
+            db.commit()
+    finally:
+        db.close()
 
 
 init_db()
@@ -157,38 +81,38 @@ def _touch_device(device_id: str, event_id: int | None = None) -> None:
         return
     ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
     now = _now_str()
-    with _db() as conn:
-        conn.execute(
-            """
-            INSERT INTO devices (device_id, last_seen, last_event_id, last_ip)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                last_event_id = COALESCE(excluded.last_event_id, devices.last_event_id),
-                last_ip = excluded.last_ip
-            """,
-            (device_id, now, event_id, ip),
-        )
-        conn.commit()
+    
+    db = get_db_session()
+    try:
+        device = db.query(Device).filter(Device.device_id == device_id).first()
+        if device:
+            device.last_seen = now
+            device.last_event_id = event_id
+            device.last_ip = ip
+        else:
+            device = Device(device_id=device_id, last_seen=now, last_event_id=event_id, last_ip=ip)
+            db.add(device)
+        db.commit()
+    finally:
+        db.close()
 
 
-def _touch_device_conn(conn: sqlite3.Connection, device_id: str, event_id: int | None = None) -> None:
+def _touch_device_orm(db, device_id: str, event_id: int | None = None) -> None:
+    """Touch device within an active session context."""
     device_id = (device_id or "").strip()
     if not device_id:
         return
     ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
     now = _now_str()
-    conn.execute(
-        """
-        INSERT INTO devices (device_id, last_seen, last_event_id, last_ip)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(device_id) DO UPDATE SET
-            last_seen = excluded.last_seen,
-            last_event_id = COALESCE(excluded.last_event_id, devices.last_event_id),
-            last_ip = excluded.last_ip
-        """,
-        (device_id, now, event_id, ip),
-    )
+    
+    device = db.query(Device).filter(Device.device_id == device_id).first()
+    if device:
+        device.last_seen = now
+        device.last_event_id = event_id
+        device.last_ip = ip
+    else:
+        device = Device(device_id=device_id, last_seen=now, last_event_id=event_id, last_ip=ip)
+        db.add(device)
 
 
 def _attendance_export_rows(event_id: int, present_only: bool) -> list[dict]:
@@ -203,49 +127,59 @@ def _attendance_export_rows_for_session(*, event_id: int, session_id: int, prese
     if session_id <= 0:
         session_id = _ensure_default_session(event_id)
 
-    with _db() as conn:
+    db = get_db_session()
+    try:
         if present_only:
-            rows = conn.execute(
-                """
-                SELECT s.uid, s.name, s.branch, s.year,
-                       'Present' AS status,
-                       sa.timestamp AS timestamp,
-                       sa.source AS source,
-                       sa.device_id AS device_id
-                  FROM session_attendance sa
-                  JOIN students s
-                    ON s.event_id = sa.event_id AND s.uid = sa.uid
-                 WHERE sa.event_id = ? AND sa.session_id = ?
-                 ORDER BY sa.timestamp DESC, s.name, s.uid
-                """,
-                (event_id, session_id),
-            ).fetchall()
+            rows = db.query(
+                Student.uid, Student.name, Student.branch, Student.year,
+                func.literal("Present").label("status"),
+                SessionAttendance.timestamp, SessionAttendance.source, SessionAttendance.device_id
+            ).join(
+                SessionAttendance,
+                and_(
+                    SessionAttendance.event_id == Student.event_id,
+                    SessionAttendance.uid == Student.uid
+                )
+            ).filter(
+                SessionAttendance.event_id == event_id,
+                SessionAttendance.session_id == session_id
+            ).order_by(
+                SessionAttendance.timestamp.desc(), Student.name, Student.uid
+            ).all()
         else:
-            rows = conn.execute(
-                """
-                SELECT s.uid, s.name, s.branch, s.year,
-                       CASE WHEN sa.uid IS NULL THEN 'Absent' ELSE 'Present' END AS status,
-                       COALESCE(sa.timestamp, '') AS timestamp,
-                       COALESCE(sa.source, 'Imported') AS source,
-                       COALESCE(sa.device_id, '') AS device_id
-                  FROM students s
-                  LEFT JOIN session_attendance sa
-                    ON sa.event_id = s.event_id AND sa.uid = s.uid AND sa.session_id = ?
-                 WHERE s.event_id = ?
-                 ORDER BY s.name, s.uid
-                """,
-                (session_id, event_id),
-            ).fetchall()
+            # Left join: all students, with their session attendance (if any)
+            rows = db.query(
+                Student.uid, Student.name, Student.branch, Student.year,
+                func.case(
+                    (SessionAttendance.uid.is_(None), "Absent"),
+                    else_="Present"
+                ).label("status"),
+                func.coalesce(SessionAttendance.timestamp, "").label("timestamp"),
+                func.coalesce(SessionAttendance.source, "Imported").label("source"),
+                func.coalesce(SessionAttendance.device_id, "").label("device_id")
+            ).outerjoin(
+                SessionAttendance,
+                and_(
+                    SessionAttendance.event_id == Student.event_id,
+                    SessionAttendance.uid == Student.uid,
+                    SessionAttendance.session_id == session_id
+                )
+            ).filter(
+                Student.event_id == event_id
+            ).order_by(
+                Student.name, Student.uid
+            ).all()
 
-    return [dict(r) for r in rows]
+        return [dict(row._mapping) if hasattr(row, '_mapping') else dict(zip(['uid', 'name', 'branch', 'year', 'status', 'timestamp', 'source', 'device_id'], row)) for row in rows]
+    finally:
+        db.close()
 
 
 def _import_students_from_excel(*, event_id: int, file_storage) -> tuple[int, str | None]:
-    """Import roster rows into students table.
+    """Import roster rows into students table using ORM.
 
     Returns: (imported_count, error_message)
     """
-    # Robust Excel import: detect UID and Name columns even when "Name" spans multiple columns
     if not file_storage:
         return 0, "file is required"
     filename = (getattr(file_storage, "filename", "") or "").lower()
@@ -262,7 +196,8 @@ def _import_students_from_excel(*, event_id: int, file_storage) -> tuple[int, st
         return 0, err
 
     inserted = 0
-    with _db() as conn:
+    db = get_db_session()
+    try:
         for r in rows:
             uid = r.get("uid", "")
             name = r.get("name", "")
@@ -270,17 +205,35 @@ def _import_students_from_excel(*, event_id: int, file_storage) -> tuple[int, st
             year = r.get("year", "")
             if not uid or not name:
                 continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO students
-                    (event_id, uid, name, branch, year, status, timestamp, source, device_id, device_timestamp)
-                VALUES
-                    (?, ?, ?, ?, ?, 'Absent', '', 'Imported', '', '')
-                """,
-                (event_id, uid, name, branch, year),
-            )
+            
+            # Use upsert pattern: find existing or create new
+            student = db.query(Student).filter(
+                Student.event_id == event_id,
+                Student.uid == uid
+            ).first()
+            
+            if student:
+                student.name = name
+                student.branch = branch
+                student.year = year
+            else:
+                student = Student(
+                    event_id=event_id,
+                    uid=uid,
+                    name=name,
+                    branch=branch,
+                    year=year,
+                    status="Absent",
+                    timestamp="",
+                    source="Imported",
+                    device_id="",
+                    device_timestamp=""
+                )
+                db.add(student)
             inserted += 1
-        conn.commit()
+        db.commit()
+    finally:
+        db.close()
 
     return inserted, None
 
@@ -409,9 +362,12 @@ def _parse_rows_from_dataframe(df: pd.DataFrame) -> tuple[list[dict], str | None
 
 
 def _get_event(event_id: int) -> dict | None:
-    with _db() as conn:
-        row = conn.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
-        return dict(row) if row else None
+    db = get_db_session()
+    try:
+        event = db.query(Event).filter(Event.event_id == event_id).first()
+        return dict(event.__dict__) if event else None
+    finally:
+        db.close()
 
 
 def _require_event_id() -> int | None:
@@ -426,20 +382,24 @@ def _require_event_id() -> int | None:
 
 
 def _get_sessions(event_id: int) -> list[dict]:
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM sessions WHERE event_id = ? ORDER BY session_id DESC", (event_id,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+    db = get_db_session()
+    try:
+        sessions = db.query(DBSession).filter(DBSession.event_id == event_id).order_by(DBSession.session_id.desc()).all()
+        return [dict(s.__dict__) for s in sessions]
+    finally:
+        db.close()
 
 
 def _get_active_session(event_id: int) -> dict | None:
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM sessions WHERE event_id = ? AND is_active = 1 ORDER BY session_id DESC LIMIT 1",
-            (event_id,),
-        ).fetchone()
-    return dict(row) if row else None
+    db = get_db_session()
+    try:
+        session = db.query(DBSession).filter(
+            DBSession.event_id == event_id,
+            DBSession.is_active == 1
+        ).order_by(DBSession.session_id.desc()).first()
+        return dict(session.__dict__) if session else None
+    finally:
+        db.close()
 
 
 def _ensure_default_session(event_id: int) -> int:
@@ -447,45 +407,48 @@ def _ensure_default_session(event_id: int) -> int:
     if active:
         return int(active.get("session_id") or 0)
 
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT session_id FROM sessions WHERE event_id = ? ORDER BY session_id DESC LIMIT 1",
-            (event_id,),
-        ).fetchone()
-        if row:
-            sid = int(row[0])
-            conn.execute("UPDATE sessions SET is_active = 1 WHERE session_id = ?", (sid,))
-            conn.commit()
-            return sid
+    db = get_db_session()
+    try:
+        # Find the most recent session for this event
+        session = db.query(DBSession).filter(
+            DBSession.event_id == event_id
+        ).order_by(DBSession.session_id.desc()).first()
+        
+        if session:
+            session.is_active = 1
+            db.commit()
+            return int(session.session_id)
 
-        conn.execute(
-            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
-            (event_id, "Session 1", _now_str()),
+        # Create a new default session if none exist
+        new_session = DBSession(
+            event_id=event_id,
+            session_name="Session 1",
+            is_active=1,
+            created_at=_now_str()
         )
-        sid = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()[0])
-        conn.commit()
-        return sid
+        db.add(new_session)
+        db.flush()
+        session_id = new_session.session_id
+        db.commit()
+        return session_id
+    finally:
+        db.close()
 
 
 def _reset_event_roster_for_new_session(event_id: int) -> None:
-    """Reset per-student attendance fields so a new session can be taken for the same event.
-
-    Note: This does not preserve historical sessions; it simply starts a fresh run.
-    """
-    with _db() as conn:
-        conn.execute(
-            """
-            UPDATE students
-               SET status = 'Absent',
-                   timestamp = '',
-                   source = 'Imported',
-                   device_id = '',
-                   device_timestamp = ''
-             WHERE event_id = ?
-            """,
-            (event_id,),
-        )
-        conn.commit()
+    """Reset per-student attendance fields so a new session can be taken for the same event."""
+    db = get_db_session()
+    try:
+        db.query(Student).filter(Student.event_id == event_id).update({
+            Student.status: "Absent",
+            Student.timestamp: "",
+            Student.source: "Imported",
+            Student.device_id: "",
+            Student.device_timestamp: ""
+        })
+        db.commit()
+    finally:
+        db.close()
 
 
 def _roster_counts(event_id: int) -> dict:
@@ -500,15 +463,16 @@ def _session_counts(*, event_id: int, session_id: int) -> dict:
     if session_id <= 0:
         session_id = _ensure_default_session(event_id)
 
-    with _db() as conn:
-        total = int(conn.execute("SELECT COUNT(*) AS n FROM students WHERE event_id = ?", (event_id,)).fetchone()[0])
-        present = int(
-            conn.execute(
-                "SELECT COUNT(*) AS n FROM session_attendance WHERE event_id = ? AND session_id = ?",
-                (event_id, session_id),
-            ).fetchone()[0]
-        )
-    return {"total": total, "present": present, "remaining": max(total - present, 0), "total_scanned": present}
+    db = get_db_session()
+    try:
+        total = db.query(func.count(Student.uid)).filter(Student.event_id == event_id).scalar() or 0
+        present = db.query(func.count(SessionAttendance.uid)).filter(
+            SessionAttendance.event_id == event_id,
+            SessionAttendance.session_id == session_id
+        ).scalar() or 0
+        return {"total": int(total), "present": int(present), "remaining": max(int(total) - int(present), 0), "total_scanned": int(present)}
+    finally:
+        db.close()
 
 
 def admin_required(fn):
@@ -541,12 +505,15 @@ def home():
 @app.get("/events")
 def list_events():
     active_only = request.args.get("active") == "1"
-    with _db() as conn:
+    db = get_db_session()
+    try:
         if active_only:
-            rows = conn.execute("SELECT * FROM events WHERE is_active = 1 ORDER BY event_id DESC").fetchall()
+            events = db.query(Event).filter(Event.is_active == 1).order_by(Event.event_id.desc()).all()
         else:
-            rows = conn.execute("SELECT * FROM events ORDER BY event_id DESC").fetchall()
-    return jsonify([dict(r) for r in rows])
+            events = db.query(Event).order_by(Event.event_id.desc()).all()
+        return jsonify([dict(e.__dict__) for e in events])
+    finally:
+        db.close()
 
 
 @app.post("/import")
@@ -743,102 +710,91 @@ def mark_attendance():
     if not uid or event_id <= 0:
         return jsonify({"error": "uid and event_id are required"}), 400
 
-    active_session = _get_active_session(event_id)
-    if not active_session:
-        _ensure_default_session(event_id)
-        active_session = _get_active_session(event_id)
-    session_id = int(active_session.get("session_id") or 0) if active_session else 0
-    if session_id <= 0:
-        return jsonify({"error": "No active session. Please open a session in admin dashboard."}), 403
-
-    # Perform the marking inside an immediate transaction using a single connection
-    now = _now_str()
-    conn = _db()
+    db = get_db_session()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-
-        # validate event and active session using same connection
-        event_row = conn.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
-        if not event_row:
-            conn.execute("ROLLBACK")
+        # Validate event exists and is active
+        event = db.query(Event).filter(Event.event_id == event_id).first()
+        if not event:
             return jsonify({"error": "Invalid event_id"}), 404
-        if not bool(event_row.get("is_active")):
-            conn.execute("ROLLBACK")
+        if not event.is_active:
             return jsonify({"error": "Event is closed"}), 403
 
-        # ensure active session exists (create default session if needed)
-        active = conn.execute(
-            "SELECT * FROM sessions WHERE event_id = ? AND is_active = 1 ORDER BY session_id DESC LIMIT 1",
-            (event_id,),
-        ).fetchone()
-        if not active:
-            conn.execute(
-                "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
-                (event_id, "Session 1", _now_str()),
+        # Ensure active session exists (create default if needed)
+        active_session = db.query(DBSession).filter(
+            DBSession.event_id == event_id,
+            DBSession.is_active == 1
+        ).order_by(DBSession.session_id.desc()).first()
+        
+        if not active_session:
+            active_session = DBSession(
+                event_id=event_id,
+                session_name="Session 1",
+                is_active=1,
+                created_at=_now_str()
             )
-            session_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()[0])
-        else:
-            session_id = int(active.get("session_id") or 0)
+            db.add(active_session)
+            db.flush()
+        
+        session_id = active_session.session_id
 
-        # touch device using current connection
-        _touch_device_conn(conn, device_id, event_id)
+        # Touch device
+        _touch_device_orm(db, device_id, event_id)
 
-        # ensure student exists and is not already present
-        row = conn.execute(
-            "SELECT * FROM students WHERE event_id = ? AND uid = ? LIMIT 1", (event_id, uid)
-        ).fetchone()
-        if not row:
-            conn.execute("ROLLBACK")
+        # Check if student exists
+        student = db.query(Student).filter(
+            Student.event_id == event_id,
+            Student.uid == uid
+        ).first()
+        
+        if not student:
+            db.close()
             return jsonify({"error": "Invalid UID"}), 404
 
-        existing = dict(row)
-        if (existing.get("status") or "").lower() == "present":
-            conn.execute("ROLLBACK")
-            return jsonify({"error": "Already marked", "student": existing}), 409
+        # Check if already marked present
+        if student.status and student.status.lower() == "present":
+            student_dict = dict(student.__dict__)
+            db.close()
+            return jsonify({"error": "Already marked", "student": student_dict}), 409
 
-        conn.execute(
-            """
-            UPDATE students
-               SET status = 'Present',
-                   timestamp = ?,
-                   source = 'Scanned',
-                   device_id = ?,
-                   device_timestamp = ?
-             WHERE event_id = ? AND uid = ?
-            """,
-            (now, device_id, device_timestamp, event_id, uid),
-        )
+        # Mark present
+        now = _now_str()
+        student.status = "Present"
+        student.timestamp = now
+        student.source = "Scanned"
+        student.device_id = device_id
+        student.device_timestamp = device_timestamp
 
-        # Record per-session attendance (history) atomically.
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO session_attendance
-                (session_id, event_id, uid, timestamp, source, device_id, device_timestamp)
-            VALUES
-                (?, ?, ?, ?, 'Scanned', ?, ?)
-            """,
-            (session_id, event_id, uid, now, device_id, device_timestamp),
-        )
+        # Record session attendance
+        session_att = db.query(SessionAttendance).filter(
+            SessionAttendance.session_id == session_id,
+            SessionAttendance.uid == uid
+        ).first()
+        
+        if not session_att:
+            session_att = SessionAttendance(
+                session_id=session_id,
+                event_id=event_id,
+                uid=uid,
+                timestamp=now,
+                source="Scanned",
+                device_id=device_id,
+                device_timestamp=device_timestamp
+            )
+            db.add(session_att)
+        else:
+            session_att.timestamp = now
+            session_att.source = "Scanned"
+            session_att.device_id = device_id
+            session_att.device_timestamp = device_timestamp
 
-        conn.commit()
-
-        updated = conn.execute(
-            "SELECT * FROM students WHERE event_id = ? AND uid = ? LIMIT 1", (event_id, uid)
-        ).fetchone()
-        student = dict(updated) if updated else existing
-    except sqlite3.OperationalError as e:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        return jsonify({"error": "Database busy or error", "detail": str(e)}), 500
+        db.commit()
+        student_dict = dict(student.__dict__)
+        return jsonify({"success": True, "timestamp": now, "student": student_dict})
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": "Database error", "detail": str(e)}), 500
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    return jsonify({"success": True, "timestamp": now, "student": student})
+        db.close()
 
 
 @app.get("/search")
@@ -851,17 +807,15 @@ def search_students():
     if not q:
         return jsonify([])
 
-    with _db() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM students
-             WHERE event_id = ?
-               AND (name LIKE ? OR uid LIKE ?)
-             ORDER BY name, uid
-            """,
-            (event_id, f"%{q}%", f"%{q}%"),
-        ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    db = get_db_session()
+    try:
+        students = db.query(Student).filter(
+            Student.event_id == event_id,
+            or_(Student.name.ilike(f"%{q}%"), Student.uid.ilike(f"%{q}%"))
+        ).order_by(Student.name, Student.uid).all()
+        return jsonify([dict(s.__dict__) for s in students])
+    finally:
+        db.close()
 
 
 @app.post("/add")
@@ -888,40 +842,70 @@ def add_student():
         return jsonify({"error": "No active session. Please open a session in admin dashboard."}), 403
 
     now = _now_str()
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM students WHERE event_id = ? AND uid = ? LIMIT 1", (event_id, uid)
-        ).fetchone()
-        if row and (row["status"] or "").lower() == "present":
-            return jsonify({"error": "Already marked", "student": dict(row)}), 409
+    db = get_db_session()
+    try:
+        # Find or create student
+        student = db.query(Student).filter(
+            Student.event_id == event_id,
+            Student.uid == uid
+        ).first()
+        
+        if student and student.status and student.status.lower() == "present":
+            student_dict = dict(student.__dict__)
+            return jsonify({"error": "Already marked", "student": student_dict}), 409
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO students
-                (event_id, uid, name, branch, year, status, timestamp, source, device_id, device_timestamp)
-            VALUES
-                (?, ?, ?, ?, ?, 'Present', ?, 'Manual', '', '')
-            """,
-            (event_id, uid, name, branch, year, now),
-        )
+        if student:
+            student.name = name
+            student.branch = branch
+            student.year = year
+            student.status = "Present"
+            student.timestamp = now
+            student.source = "Manual"
+            student.device_id = ""
+            student.device_timestamp = ""
+        else:
+            student = Student(
+                event_id=event_id,
+                uid=uid,
+                name=name,
+                branch=branch,
+                year=year,
+                status="Present",
+                timestamp=now,
+                source="Manual",
+                device_id="",
+                device_timestamp=""
+            )
+            db.add(student)
+        
+        db.flush()
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO session_attendance
-                (session_id, event_id, uid, timestamp, source, device_id, device_timestamp)
-            VALUES
-                (?, ?, ?, ?, 'Manual', '', '')
-            """,
-            (session_id, event_id, uid, now),
-        )
-        conn.commit()
+        # Record session attendance
+        session_att = db.query(SessionAttendance).filter(
+            SessionAttendance.session_id == session_id,
+            SessionAttendance.uid == uid
+        ).first()
+        
+        if not session_att:
+            session_att = SessionAttendance(
+                session_id=session_id,
+                event_id=event_id,
+                uid=uid,
+                timestamp=now,
+                source="Manual",
+                device_id="",
+                device_timestamp=""
+            )
+            db.add(session_att)
+        else:
+            session_att.timestamp = now
+            session_att.source = "Manual"
 
-        updated = conn.execute(
-            "SELECT * FROM students WHERE event_id = ? AND uid = ? LIMIT 1", (event_id, uid)
-        ).fetchone()
-        student = dict(updated) if updated else {"event_id": event_id, "uid": uid, "name": name}
-
-    return jsonify({"success": True, "timestamp": now, "student": student})
+        db.commit()
+        student_dict = dict(student.__dict__)
+        return jsonify({"success": True, "timestamp": now, "student": student_dict})
+    finally:
+        db.close()
 
 
 @app.get("/stats")
@@ -938,12 +922,13 @@ def stats():
     if event_id:
         return jsonify(_roster_counts(event_id))
 
-    with _db() as conn:
-        total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()[0]
-        present = conn.execute("SELECT COUNT(*) AS n FROM students WHERE status = 'Present'").fetchone()[0]
-    total = int(total)
-    present = int(present)
-    return jsonify({"total": total, "present": present, "remaining": max(total - present, 0)})
+    db = get_db_session()
+    try:
+        total = db.query(func.count(Student.uid)).scalar() or 0
+        present = db.query(func.count(Student.uid)).filter(Student.status == "Present").scalar() or 0
+        return jsonify({"total": int(total), "present": int(present), "remaining": max(int(total) - int(present), 0)})
+    finally:
+        db.close()
 
 
 @app.get("/admin/login")
@@ -987,33 +972,36 @@ def admin_logout():
 @app.get("/admin")
 @admin_required
 def admin_dashboard():
-    with _db() as conn:
-        events = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY event_id DESC").fetchall()]
-
-    selected_event_id = request.args.get("event_id")
+    db = get_db_session()
     try:
-        selected_event_id = int(selected_event_id) if selected_event_id is not None else None
-    except ValueError:
-        selected_event_id = None
+        events = [dict(e.__dict__) for e in db.query(Event).order_by(Event.event_id.desc()).all()]
 
-    if not selected_event_id and events:
-        active = next((e for e in events if int(e.get("is_active") or 0) == 1), None)
-        selected_event_id = int((active or events[0])["event_id"])
+        selected_event_id = request.args.get("event_id")
+        try:
+            selected_event_id = int(selected_event_id) if selected_event_id is not None else None
+        except ValueError:
+            selected_event_id = None
 
-    sessions = _get_sessions(int(selected_event_id)) if selected_event_id else []
-    active_session = _get_active_session(int(selected_event_id)) if selected_event_id else None
-    if selected_event_id and not active_session:
-        _ensure_default_session(int(selected_event_id))
-        sessions = _get_sessions(int(selected_event_id))
-        active_session = _get_active_session(int(selected_event_id))
+        if not selected_event_id and events:
+            active = next((e for e in events if int(e.get("is_active") or 0) == 1), None)
+            selected_event_id = int((active or events[0])["event_id"])
 
-    return render_template(
-        "admin_dashboard.html",
-        events=events,
-        selected_event_id=selected_event_id,
-        sessions=sessions,
-        active_session=active_session,
-    )
+        sessions = _get_sessions(int(selected_event_id)) if selected_event_id else []
+        active_session = _get_active_session(int(selected_event_id)) if selected_event_id else None
+        if selected_event_id and not active_session:
+            _ensure_default_session(int(selected_event_id))
+            sessions = _get_sessions(int(selected_event_id))
+            active_session = _get_active_session(int(selected_event_id))
+
+        return render_template(
+            "admin_dashboard.html",
+            events=events,
+            selected_event_id=selected_event_id,
+            sessions=sessions,
+            active_session=active_session,
+        )
+    finally:
+        db.close()
 
 
 @app.get("/admin/api/dashboard")
@@ -1038,76 +1026,79 @@ def admin_api_dashboard():
     online_window_seconds = int(os.environ.get("DEVICE_ONLINE_SECONDS", "120") or "120")
     online_cutoff = datetime.now() - timedelta(seconds=online_window_seconds)
 
-    with _db() as conn:
-        present_by_device = {
-            r["device_id"]: int(r["present_count"])
-            for r in conn.execute(
-                """
-                SELECT device_id, COUNT(*) AS present_count
-                  FROM session_attendance
-                 WHERE event_id = ? AND session_id = ? AND device_id != ''
-                 GROUP BY device_id
-                """,
-                (event_id, session_id),
-            ).fetchall()
-        }
+    db = get_db_session()
+    try:
+        # Get device attendance counts
+        device_att_counts = db.query(
+            SessionAttendance.device_id,
+            func.count(SessionAttendance.uid).label("present_count")
+        ).filter(
+            SessionAttendance.event_id == event_id,
+            SessionAttendance.session_id == session_id,
+            SessionAttendance.device_id != ''
+        ).group_by(SessionAttendance.device_id).all()
+        
+        present_by_device = {row[0]: row[1] for row in device_att_counts}
 
-        device_info = {
-            r["device_id"]: dict(r)
-            for r in conn.execute(
-                """
-                SELECT device_id, last_seen, last_ip
-                  FROM devices
-                 WHERE last_event_id = ?
-                """,
-                (event_id,),
-            ).fetchall()
-        }
+        # Get device info
+        devices = db.query(Device).filter(Device.last_event_id == event_id).all()
+        device_info = {d.device_id: {"device_id": d.device_id, "last_seen": d.last_seen, "last_ip": d.last_ip} for d in devices}
 
-        # Live attendance for the selected session.
-        attendance_rows = conn.execute(
-            """
-            SELECT s.uid, s.name, s.branch, s.year,
-                   'Present' AS status,
-                   sa.timestamp AS timestamp,
-                   sa.source AS source,
-                   sa.device_id AS device_id
-              FROM session_attendance sa
-              JOIN students s
-                ON s.event_id = sa.event_id AND s.uid = sa.uid
-             WHERE sa.event_id = ? AND sa.session_id = ?
-             ORDER BY sa.timestamp DESC, s.name, s.uid
-            """,
-            (event_id, session_id),
-        ).fetchall()
+        # Live attendance for the selected session
+        attendance = db.query(
+            Student.uid, Student.name, Student.branch, Student.year,
+            func.literal("Present").label("status"),
+            SessionAttendance.timestamp, SessionAttendance.source, SessionAttendance.device_id
+        ).join(
+            SessionAttendance,
+            and_(
+                SessionAttendance.event_id == Student.event_id,
+                SessionAttendance.uid == Student.uid
+            )
+        ).filter(
+            SessionAttendance.event_id == event_id,
+            SessionAttendance.session_id == session_id
+        ).order_by(
+            SessionAttendance.timestamp.desc(), Student.name, Student.uid
+        ).all()
 
-    device_ids = set(present_by_device.keys()) | set(device_info.keys())
-    device_stats: list[dict] = []
-    for device_id in device_ids:
-        info = device_info.get(device_id, {})
-        last_seen = str(info.get("last_seen", "") or "")
-        last_seen_dt = _parse_dt(last_seen)
-        online = bool(last_seen_dt and last_seen_dt >= online_cutoff)
-        device_stats.append(
+        device_ids = set(present_by_device.keys()) | set(device_info.keys())
+        device_stats: list[dict] = []
+        for device_id in device_ids:
+            info = device_info.get(device_id, {})
+            last_seen = str(info.get("last_seen", "") or "")
+            last_seen_dt = _parse_dt(last_seen)
+            online = bool(last_seen_dt and last_seen_dt >= online_cutoff)
+            device_stats.append(
+                {
+                    "device_id": device_id,
+                    "present_count": int(present_by_device.get(device_id, 0)),
+                    "last_seen": last_seen,
+                    "last_ip": str(info.get("last_ip", "") or ""),
+                    "online": online,
+                }
+            )
+        device_stats.sort(key=lambda d: (not bool(d.get("online")), -(int(d.get("present_count") or 0)), str(d.get("device_id") or "")))
+
+        # Convert attendance rows to dicts
+        attendance_list = []
+        for row in attendance:
+            if hasattr(row, '_mapping'):
+                attendance_list.append(dict(row._mapping))
+            else:
+                attendance_list.append(dict(zip(['uid', 'name', 'branch', 'year', 'status', 'timestamp', 'source', 'device_id'], row)))
+
+        return jsonify(
             {
-                "device_id": device_id,
-                "present_count": int(present_by_device.get(device_id, 0)),
-                "last_seen": last_seen,
-                "last_ip": str(info.get("last_ip", "") or ""),
-                "online": online,
+                "server_time": _now_str(),
+                "summary": summary,
+                "device_stats": device_stats,
+                "session_id": session_id,
+                "attendance": attendance_list,
             }
         )
-    device_stats.sort(key=lambda d: (not bool(d.get("online")), -(int(d.get("present_count") or 0)), str(d.get("device_id") or "")))
-
-    return jsonify(
-        {
-            "server_time": _now_str(),
-            "summary": summary,
-            "device_stats": device_stats,
-            "session_id": session_id,
-            "attendance": [dict(r) for r in attendance_rows],
-        }
-    )
+    finally:
+        db.close()
 
 
 @app.post("/admin/events/create")
@@ -1120,19 +1111,29 @@ def admin_create_event():
     if not name:
         return redirect(url_for("admin_dashboard"))
 
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO events (event_name, start_time, end_time, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
-            (name, start_time, end_time, is_active, _now_str()),
+    db = get_db_session()
+    try:
+        event = Event(
+            event_name=name,
+            start_time=start_time,
+            end_time=end_time,
+            is_active=is_active,
+            created_at=_now_str()
         )
-        event_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()[0])
+        db.add(event)
+        db.flush()
 
-        # Create a default session for the event.
-        conn.execute(
-            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, ?, ?)",
-            (event_id, "Session 1", 1 if is_active else 0, _now_str()),
+        # Create a default session for the event
+        session = DBSession(
+            event_id=event.event_id,
+            session_name="Session 1",
+            is_active=1 if is_active else 0,
+            created_at=_now_str()
         )
-        conn.commit()
+        db.add(session)
+        db.commit()
+    finally:
+        db.close()
 
     return redirect(url_for("admin_dashboard"))
 
@@ -1153,21 +1154,37 @@ def admin_api_sessions():
 @app.post("/admin/events/<int:event_id>/sessions/create")
 @admin_required
 def admin_create_session(event_id: int):
-    if not _get_event(event_id):
-        return redirect(url_for("admin_dashboard"))
+    db = get_db_session()
+    try:
+        event = db.query(Event).filter(Event.event_id == event_id).first()
+        if not event:
+            return redirect(url_for("admin_dashboard"))
 
-    name = (request.form.get("session_name") or "").strip() or f"Session {_now_str()}"
+        name = (request.form.get("session_name") or "").strip() or f"Session {_now_str()}"
 
-    # Creating a new session implies we want to take attendance again.
-    _reset_event_roster_for_new_session(event_id)
+        # Creating a new session implies we want to take attendance again.
+        db.query(Student).filter(Student.event_id == event_id).update({
+            Student.status: "Absent",
+            Student.timestamp: "",
+            Student.source: "Imported",
+            Student.device_id: "",
+            Student.device_timestamp: ""
+        })
 
-    with _db() as conn:
-        conn.execute("UPDATE sessions SET is_active = 0 WHERE event_id = ?", (event_id,))
-        conn.execute(
-            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
-            (event_id, name, _now_str()),
+        # Deactivate all sessions for this event
+        db.query(DBSession).filter(DBSession.event_id == event_id).update({DBSession.is_active: 0})
+
+        # Create new active session
+        new_session = DBSession(
+            event_id=event_id,
+            session_name=name,
+            is_active=1,
+            created_at=_now_str()
         )
-        conn.commit()
+        db.add(new_session)
+        db.commit()
+    finally:
+        db.close()
 
     return redirect(url_for("admin_dashboard", event_id=event_id))
 
@@ -1175,24 +1192,30 @@ def admin_create_session(event_id: int):
 @app.post("/admin/sessions/<int:session_id>/open")
 @admin_required
 def admin_open_session(session_id: int):
-    with _db() as conn:
-        row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
-        if not row:
+    db = get_db_session()
+    try:
+        session = db.query(DBSession).filter(DBSession.session_id == session_id).first()
+        if not session:
             return ("", 404)
-        session_row = dict(row)
-        event_id = int(session_row["event_id"])
+        
+        event_id = session.event_id
 
-        newest = conn.execute(
-            "SELECT session_id FROM sessions WHERE event_id = ? ORDER BY session_id DESC LIMIT 1",
-            (event_id,),
-        ).fetchone()
-        newest_id = int(newest[0]) if newest else 0
-        if newest_id and int(session_id) != newest_id:
+        # Check if this is the newest session
+        newest = db.query(DBSession).filter(
+            DBSession.event_id == event_id
+        ).order_by(DBSession.session_id.desc()).first()
+        
+        if newest and newest.session_id != session_id:
             return (jsonify({"error": "Older sessions are view-only. Create a new session to take attendance again."}), 409)
 
-        conn.execute("UPDATE sessions SET is_active = 0 WHERE event_id = ?", (event_id,))
-        conn.execute("UPDATE sessions SET is_active = 1 WHERE session_id = ?", (session_id,))
-        conn.commit()
+        # Deactivate all sessions for this event
+        db.query(DBSession).filter(DBSession.event_id == event_id).update({DBSession.is_active: 0})
+
+        # Activate this session
+        session.is_active = 1
+        db.commit()
+    finally:
+        db.close()
 
     return ("", 204)
 
@@ -1200,27 +1223,36 @@ def admin_open_session(session_id: int):
 @app.post("/admin/sessions/<int:session_id>/close")
 @admin_required
 def admin_close_session(session_id: int):
-    with _db() as conn:
-        conn.execute("UPDATE sessions SET is_active = 0 WHERE session_id = ?", (session_id,))
-        conn.commit()
+    db = get_db_session()
+    try:
+        db.query(DBSession).filter(DBSession.session_id == session_id).update({DBSession.is_active: 0})
+        db.commit()
+    finally:
+        db.close()
     return ("", 204)
 
 
 @app.post("/admin/events/<int:event_id>/close")
 @admin_required
 def admin_close_event(event_id: int):
-    with _db() as conn:
-        conn.execute("UPDATE events SET is_active = 0 WHERE event_id = ?", (event_id,))
-        conn.commit()
+    db = get_db_session()
+    try:
+        db.query(Event).filter(Event.event_id == event_id).update({Event.is_active: 0})
+        db.commit()
+    finally:
+        db.close()
     return ("", 204)
 
 
 @app.post("/admin/events/<int:event_id>/open")
 @admin_required
 def admin_open_event(event_id: int):
-    with _db() as conn:
-        conn.execute("UPDATE events SET is_active = 1 WHERE event_id = ?", (event_id,))
-        conn.commit()
+    db = get_db_session()
+    try:
+        db.query(Event).filter(Event.event_id == event_id).update({Event.is_active: 1})
+        db.commit()
+    finally:
+        db.close()
     _ensure_default_session(event_id)
     return ("", 204)
 
@@ -1229,21 +1261,28 @@ def admin_open_event(event_id: int):
 @admin_required
 def admin_clear_event(event_id: int):
     """Clear roster, sessions and attendance for an event so it can be reused."""
-    if not _get_event(event_id):
-        return (jsonify({"error": "Invalid event_id"}), 404)
+    db = get_db_session()
+    try:
+        event = db.query(Event).filter(Event.event_id == event_id).first()
+        if not event:
+            return (jsonify({"error": "Invalid event_id"}), 404)
 
-    with _db() as conn:
         # Remove per-session attendance and roster entries for this event
-        conn.execute("DELETE FROM session_attendance WHERE event_id = ?", (event_id,))
-        conn.execute("DELETE FROM students WHERE event_id = ?", (event_id,))
-        conn.execute("DELETE FROM sessions WHERE event_id = ?", (event_id,))
+        db.query(SessionAttendance).filter(SessionAttendance.event_id == event_id).delete()
+        db.query(Student).filter(Student.event_id == event_id).delete()
+        db.query(DBSession).filter(DBSession.event_id == event_id).delete()
 
         # Recreate a default session for this event
-        conn.execute(
-            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
-            (event_id, "Session 1", _now_str()),
+        new_session = DBSession(
+            event_id=event_id,
+            session_name="Session 1",
+            is_active=1,
+            created_at=_now_str()
         )
-        conn.commit()
+        db.add(new_session)
+        db.commit()
+    finally:
+        db.close()
 
     return ("", 204)
 
@@ -1251,27 +1290,36 @@ def admin_clear_event(event_id: int):
 @app.post("/admin/sessions/<int:session_id>/clear")
 @admin_required
 def admin_clear_session(session_id: int):
-    """Clear attendance for a specific session. If it's the active session for its event,
-    students' status is reset to 'Absent' as well."""
-    with _db() as conn:
-        row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
-        if not row:
+    """Clear attendance for a specific session."""
+    db = get_db_session()
+    try:
+        session = db.query(DBSession).filter(DBSession.session_id == session_id).first()
+        if not session:
             return (jsonify({"error": "Invalid session_id"}), 404)
-        session_row = dict(row)
-        event_id = int(session_row["event_id"]) if session_row.get("event_id") else None
+
+        event_id = session.event_id
 
         # Delete session attendance rows
-        conn.execute("DELETE FROM session_attendance WHERE session_id = ?", (session_id,))
+        db.query(SessionAttendance).filter(SessionAttendance.session_id == session_id).delete()
 
         # If this session is the active session for the event, reset per-student attendance fields
-        active = _get_active_session(event_id) if event_id else None
-        if active and int(active.get("session_id") or 0) == int(session_id):
-            conn.execute(
-                "UPDATE students SET status = 'Absent', timestamp = '', source = 'Imported', device_id = '', device_timestamp = '' WHERE event_id = ?",
-                (event_id,),
-            )
+        active = db.query(DBSession).filter(
+            DBSession.event_id == event_id,
+            DBSession.is_active == 1
+        ).first()
+        
+        if active and active.session_id == session_id:
+            db.query(Student).filter(Student.event_id == event_id).update({
+                Student.status: "Absent",
+                Student.timestamp: "",
+                Student.source: "Imported",
+                Student.device_id: "",
+                Student.device_timestamp: ""
+            })
 
-        conn.commit()
+        db.commit()
+    finally:
+        db.close()
 
     return ("", 204)
 
@@ -1279,26 +1327,37 @@ def admin_clear_session(session_id: int):
 @app.post("/admin/clear_all")
 @admin_required
 def admin_clear_all():
-    """Clear all app data and recreate a default event + session. Use with caution."""
-    with _db() as conn:
-        conn.execute("DELETE FROM session_attendance")
-        conn.execute("DELETE FROM students")
-        conn.execute("DELETE FROM sessions")
-        conn.execute("DELETE FROM devices")
-        conn.execute("DELETE FROM events")
-        conn.commit()
+    """Clear all app data and recreate a default event + session."""
+    db = get_db_session()
+    try:
+        db.query(SessionAttendance).delete()
+        db.query(Student).delete()
+        db.query(DBSession).delete()
+        db.query(Device).delete()
+        db.query(Event).delete()
+        db.commit()
 
         # Seed a default event and session
-        conn.execute(
-            "INSERT INTO events (event_name, start_time, end_time, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("Default Event", "", "", 1, _now_str()),
+        default_event = Event(
+            event_name="Default Event",
+            start_time="",
+            end_time="",
+            is_active=1,
+            created_at=_now_str()
         )
-        seeded_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()[0])
-        conn.execute(
-            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
-            (seeded_id, "Session 1", _now_str()),
+        db.add(default_event)
+        db.flush()
+
+        default_session = DBSession(
+            event_id=default_event.event_id,
+            session_name="Session 1",
+            is_active=1,
+            created_at=_now_str()
         )
-        conn.commit()
+        db.add(default_session)
+        db.commit()
+    finally:
+        db.close()
 
     return ("", 204)
 
@@ -1319,33 +1378,44 @@ def api_event_live(event_id: int):
     active = _get_active_session(event_id)
     session_id = int(active.get("session_id") or 0) if active else _ensure_default_session(event_id)
     summary = _session_counts(event_id=event_id, session_id=session_id)
-    with _db() as conn:
-        recent = conn.execute(
-            """
-            SELECT s.uid, s.name, s.branch, s.year,
-                   'Present' AS status,
-                   sa.timestamp AS timestamp,
-                   sa.source AS source,
-                   sa.device_id AS device_id
-              FROM session_attendance sa
-              JOIN students s
-                ON s.event_id = sa.event_id AND s.uid = sa.uid
-             WHERE sa.event_id = ? AND sa.session_id = ?
-             ORDER BY sa.timestamp DESC
-             LIMIT 50
-            """,
-            (event_id, session_id),
-        ).fetchall()
+    
+    db = get_db_session()
+    try:
+        recent = db.query(
+            Student.uid, Student.name, Student.branch, Student.year,
+            func.literal("Present").label("status"),
+            SessionAttendance.timestamp, SessionAttendance.source, SessionAttendance.device_id
+        ).join(
+            SessionAttendance,
+            and_(
+                SessionAttendance.event_id == Student.event_id,
+                SessionAttendance.uid == Student.uid
+            )
+        ).filter(
+            SessionAttendance.event_id == event_id,
+            SessionAttendance.session_id == session_id
+        ).order_by(
+            SessionAttendance.timestamp.desc()
+        ).limit(50).all()
 
-    return jsonify(
-        {
-            "server_time": _now_str(),
-            "event": event,
-            "session_id": session_id,
-            "attendance": [dict(r) for r in recent],
-            **summary,
-        }
-    )
+        attendance_list = []
+        for row in recent:
+            if hasattr(row, '_mapping'):
+                attendance_list.append(dict(row._mapping))
+            else:
+                attendance_list.append(dict(zip(['uid', 'name', 'branch', 'year', 'status', 'timestamp', 'source', 'device_id'], row)))
+
+        return jsonify(
+            {
+                "server_time": _now_str(),
+                "event": event,
+                "session_id": session_id,
+                "attendance": attendance_list,
+                **summary,
+            }
+        )
+    finally:
+        db.close()
 
 
 @app.get("/api/event/<int:event_id>/session")
@@ -1356,7 +1426,7 @@ def api_event_session(event_id: int):
 
     active = _get_active_session(event_id)
     if not active:
-        sid = _ensure_default_session(event_id)
+        _ensure_default_session(event_id)
         active = _get_active_session(event_id)
         if not active:
             return jsonify({"error": "No open session"}), 404
@@ -1373,21 +1443,21 @@ def api_event_session(event_id: int):
 
 @app.get("/api/event/<int:event_id>/roster")
 def api_event_roster(event_id: int):
-    """Public roster endpoint for Android clients.
-
-    Returns the student list imported for the event (UID/Name/Branch/Year).
-    """
+    """Public roster endpoint for Android clients."""
     event = _get_event(event_id)
     if not event:
         return jsonify({"error": "Not found"}), 404
 
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT uid, name, branch, year FROM students WHERE event_id = ? ORDER BY name, uid",
-            (event_id,),
-        ).fetchall()
-
-    return jsonify([dict(r) for r in rows])
+    db = get_db_session()
+    try:
+        students = db.query(Student.uid, Student.name, Student.branch, Student.year).filter(
+            Student.event_id == event_id
+        ).order_by(Student.name, Student.uid).all()
+        
+        roster = [dict(zip(['uid', 'name', 'branch', 'year'], s)) for s in students]
+        return jsonify(roster)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
