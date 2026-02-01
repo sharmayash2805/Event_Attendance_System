@@ -41,6 +41,7 @@ fun HomeScreen(
 	openSession: SessionDto?,
     onScanClick: () -> Unit,
     onSearchClick: () -> Unit,
+    onAddStudentClick: () -> Unit,
     onExportClick: () -> Unit,
 	onOpenServerSettings: () -> Unit,
     connectionHint: String?,
@@ -175,7 +176,19 @@ fun HomeScreen(
 
 		Spacer(modifier = Modifier.height(16.dp))
 
-        // 5) Export attendance
+		// 5) Add student manually
+		FilledCardButton(
+			text = "ADD STUDENT",
+			icon = Icons.Default.Search,
+			iconTint = red,
+			background = card,
+			onClick = onAddStudentClick,
+			modifier = Modifier.fillMaxWidth()
+		)
+
+		Spacer(modifier = Modifier.height(16.dp))
+
+        // 6) Export attendance
         FilledCardButton(
             text = "EXPORT ATTENDANCE",
             icon = Icons.Default.Upload,

@@ -33,6 +33,7 @@ class MainActivity : ComponentActivity() {
 
 	private var showSearchScreen by mutableStateOf(false)
 	private var showExportScreen by mutableStateOf(false)
+	private var showAddStudentDialog by mutableStateOf(false)
 	private var showServerDialog by mutableStateOf(false)
 	private var serverUrl by mutableStateOf("")
 
@@ -109,6 +110,30 @@ class MainActivity : ComponentActivity() {
 					showSearchScreen -> {
 						SearchScreen(onBack = { showSearchScreen = false })
 					}
+					showAddStudentDialog -> {
+						var addStudentUid by remember { mutableStateOf("") }
+						
+						AddStudentDialog(
+							uid = addStudentUid,
+							onUidChange = { newUid -> addStudentUid = newUid },
+							onSubmit = { name, branch, year ->
+								attendanceViewModel.addStudentAndMarkPresent(
+									uid = addStudentUid,
+									name = name,
+									branch = branch,
+									year = year,
+									onSuccess = { student ->
+										Toast.makeText(this@MainActivity, "Added & Marked: ${student.name}", Toast.LENGTH_SHORT).show()
+										showAddStudentDialog = false
+									},
+									onError = { error ->
+										Toast.makeText(this@MainActivity, error, Toast.LENGTH_SHORT).show()
+									}
+								)
+							},
+							onDismiss = { showAddStudentDialog = false }
+						)
+					}
 					else -> {
 						HomeScreen(
 							stats = stats,
@@ -126,6 +151,7 @@ class MainActivity : ComponentActivity() {
 								scannerLauncher.launch(intent)
 							},
 							onSearchClick = { showSearchScreen = true },
+							onAddStudentClick = { showAddStudentDialog = true },
 							onExportClick = { showExportScreen = true },
 							onOpenServerSettings = {
 								serverUrl = ServerConfig.getBaseUrl()

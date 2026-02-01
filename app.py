@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 import pandas as pd
+import re
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 
 
@@ -16,6 +17,15 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__, template_folder="templates")
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(24)
+
+# Development convenience: ensure an admin username/password exists for
+# local testing when ADMIN_PASSWORD isn't explicitly set in the environment.
+# This only provides a default for development; do NOT rely on this in
+# production deployments.
+if not os.environ.get("ADMIN_PASSWORD"):
+    os.environ.setdefault("ADMIN_USERNAME", "admin")
+    os.environ.setdefault("ADMIN_PASSWORD", "admin")
+    print("Development: default admin credentials set -> username: 'admin', password: 'admin'")
 
 
 def _now_str() -> str:
@@ -30,8 +40,17 @@ def _parse_dt(s: str) -> datetime | None:
 
 
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # Use a timeout and enable WAL for higher-concurrency writes from multiple devices.
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    try:
+        # Enable WAL and adjust synchronous for better write concurrency.
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+    except Exception:
+        # ignore if pragmas fail on some setups
+        pass
     return conn
 
 
@@ -109,6 +128,9 @@ def init_db() -> None:
             )
             """
         )
+        # Indexes to speed up lookups under high load
+        c.execute("CREATE INDEX IF NOT EXISTS idx_session_attendance_event ON session_attendance(event_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_students_event_uid ON students(event_id, uid)")
         # Ensure at least one event exists (helps older Android local migrations that map to eventId=1).
         c.execute("SELECT COUNT(*) AS n FROM events")
         if int(c.fetchone()[0]) == 0:
@@ -148,6 +170,25 @@ def _touch_device(device_id: str, event_id: int | None = None) -> None:
             (device_id, now, event_id, ip),
         )
         conn.commit()
+
+
+def _touch_device_conn(conn: sqlite3.Connection, device_id: str, event_id: int | None = None) -> None:
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+    now = _now_str()
+    conn.execute(
+        """
+        INSERT INTO devices (device_id, last_seen, last_event_id, last_ip)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(device_id) DO UPDATE SET
+            last_seen = excluded.last_seen,
+            last_event_id = COALESCE(excluded.last_event_id, devices.last_event_id),
+            last_ip = excluded.last_ip
+        """,
+        (device_id, now, event_id, ip),
+    )
 
 
 def _attendance_export_rows(event_id: int, present_only: bool) -> list[dict]:
@@ -204,6 +245,7 @@ def _import_students_from_excel(*, event_id: int, file_storage) -> tuple[int, st
 
     Returns: (imported_count, error_message)
     """
+    # Robust Excel import: detect UID and Name columns even when "Name" spans multiple columns
     if not file_storage:
         return 0, "file is required"
     filename = (getattr(file_storage, "filename", "") or "").lower()
@@ -215,19 +257,17 @@ def _import_students_from_excel(*, event_id: int, file_storage) -> tuple[int, st
     except Exception as e:
         return 0, f"Unable to read Excel: {e}"
 
-    # Normalize column names.
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    required = {"uid", "name"}
-    if not required.issubset(set(df.columns)):
-        return 0, "Excel must have uid and name columns"
+    rows, err = _parse_rows_from_dataframe(df)
+    if err:
+        return 0, err
 
     inserted = 0
     with _db() as conn:
-        for _, row in df.iterrows():
-            uid = str(row.get("uid", "")).strip()
-            name = str(row.get("name", "")).strip()
-            branch = str(row.get("branch", "")).strip()
-            year = str(row.get("year", "")).strip()
+        for r in rows:
+            uid = r.get("uid", "")
+            name = r.get("name", "")
+            branch = r.get("branch", "")
+            year = r.get("year", "")
             if not uid or not name:
                 continue
             conn.execute(
@@ -273,20 +313,98 @@ def _excel_roster_preview_from_path(path: str) -> tuple[list[dict], str | None]:
     except Exception as e:
         return [], f"Unable to read Excel: {e}"
 
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    required = {"uid", "name"}
-    if not required.issubset(set(df.columns)):
-        return [], "Excel must have uid and name columns"
+    rows, err = _parse_rows_from_dataframe(df)
+    return rows, err
+
+
+def _normalize_header(h: str) -> str:
+    return re.sub(r"[^0-9a-z]+", "_", (str(h or "")).strip().lower())
+
+
+def _map_columns(headers: list[str]) -> dict:
+    """Return mapping of logical fields to column names in the dataframe.
+
+    Returns keys: uid_col (str or None), name_cols (list), branch_col, year_col
+    """
+    norm_to_orig = { _normalize_header(h): h for h in headers }
+    norms = list(norm_to_orig.keys())
+
+    def find_any(candidates:list[str]):
+        for cand in candidates:
+            for n in norms:
+                if n == cand or cand in n:
+                    return norm_to_orig[n]
+        return None
+
+    uid_candidates = ["uid","id","student_id","studentid","roll","roll_no","enrollment","registration","card","card_number","barcode"]
+    uid_col = find_any(uid_candidates)
+
+    # Name detection: prefer single "name" or "full_name", else combine first+last
+    name_col = find_any(["name","full_name","fullname"])
+    name_cols = []
+    if name_col:
+        name_cols = [name_col]
+    else:
+        # search for first/last/given/surname style columns
+        first = find_any(["first","given","forename"])
+        last = find_any(["last","surname","family"])
+        if first and last:
+            name_cols = [first, last]
+        else:
+            # fallback: any header containing 'name'
+            name_like = [v for k,v in norm_to_orig.items() if 'name' in k]
+            if name_like:
+                name_cols = name_like
+
+    branch_col = find_any(["branch","dept","department","program","programme","course"]) 
+    year_col = find_any(["year","class","semester","batch"])
+
+    return {"uid_col": uid_col, "name_cols": name_cols, "branch_col": branch_col, "year_col": year_col}
+
+
+def _parse_rows_from_dataframe(df: pd.DataFrame) -> tuple[list[dict], str | None]:
+    # Normalize headers but keep original names
+    headers = [str(c) for c in df.columns]
+    mapping = _map_columns(headers)
+
+    if not mapping.get("uid_col"):
+        return [], "Unable to detect UID column. Expected column names like UID, id, student_id, roll, enrollment, barcode"
+
+    if not mapping.get("name_cols"):
+        return [], "Unable to detect Name column(s). Expected column names like Name, Full Name, First/Last"
 
     rows: list[dict] = []
+    seen = set()
     for _, row in df.iterrows():
-        uid = str(row.get("uid", "")).strip()
-        name = str(row.get("name", "")).strip()
-        branch = str(row.get("branch", "")).strip()
-        year = str(row.get("year", "")).strip()
-        if not uid or not name:
+        uid_raw = row.get(mapping["uid_col"]) if mapping.get("uid_col") else None
+        uid = (str(uid_raw or "")).strip()
+        if not uid:
             continue
-        rows.append({"uid": uid, "name": name, "branch": branch, "year": year})
+
+        # build name
+        name_parts = []
+        for nc in mapping.get("name_cols", []):
+            val = str(row.get(nc) or "").strip()
+            if val:
+                name_parts.append(val)
+        name = " ".join(name_parts).strip()
+        if not name:
+            continue
+
+        branch = str(row.get(mapping.get("branch_col")) or "").strip() if mapping.get("branch_col") else ""
+        year = str(row.get(mapping.get("year_col")) or "").strip() if mapping.get("year_col") else ""
+
+        # Normalize UID minimal: trim spaces
+        uid_norm = uid
+        if uid_norm in seen:
+            # skip duplicate UID rows from the same sheet
+            continue
+        seen.add(uid_norm)
+
+        rows.append({"uid": uid_norm, "name": name, "branch": branch, "year": year})
+
+    if not rows:
+        return [], "No valid rows with UID and Name found in the Excel file"
     return rows, None
 
 
@@ -633,24 +751,49 @@ def mark_attendance():
     if session_id <= 0:
         return jsonify({"error": "No active session. Please open a session in admin dashboard."}), 403
 
-    _touch_device(device_id, event_id=event_id)
-
-    event = _get_event(event_id)
-    if not event:
-        return jsonify({"error": "Invalid event_id"}), 404
-    if not bool(event.get("is_active")):
-        return jsonify({"error": "Event is closed"}), 403
-
+    # Perform the marking inside an immediate transaction using a single connection
     now = _now_str()
-    with _db() as conn:
+    conn = _db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # validate event and active session using same connection
+        event_row = conn.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
+        if not event_row:
+            conn.execute("ROLLBACK")
+            return jsonify({"error": "Invalid event_id"}), 404
+        if not bool(event_row.get("is_active")):
+            conn.execute("ROLLBACK")
+            return jsonify({"error": "Event is closed"}), 403
+
+        # ensure active session exists (create default session if needed)
+        active = conn.execute(
+            "SELECT * FROM sessions WHERE event_id = ? AND is_active = 1 ORDER BY session_id DESC LIMIT 1",
+            (event_id,),
+        ).fetchone()
+        if not active:
+            conn.execute(
+                "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
+                (event_id, "Session 1", _now_str()),
+            )
+            session_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()[0])
+        else:
+            session_id = int(active.get("session_id") or 0)
+
+        # touch device using current connection
+        _touch_device_conn(conn, device_id, event_id)
+
+        # ensure student exists and is not already present
         row = conn.execute(
             "SELECT * FROM students WHERE event_id = ? AND uid = ? LIMIT 1", (event_id, uid)
         ).fetchone()
         if not row:
+            conn.execute("ROLLBACK")
             return jsonify({"error": "Invalid UID"}), 404
 
         existing = dict(row)
         if (existing.get("status") or "").lower() == "present":
+            conn.execute("ROLLBACK")
             return jsonify({"error": "Already marked", "student": existing}), 409
 
         conn.execute(
@@ -666,7 +809,7 @@ def mark_attendance():
             (now, device_id, device_timestamp, event_id, uid),
         )
 
-        # Record per-session attendance (history).
+        # Record per-session attendance (history) atomically.
         conn.execute(
             """
             INSERT OR REPLACE INTO session_attendance
@@ -676,12 +819,24 @@ def mark_attendance():
             """,
             (session_id, event_id, uid, now, device_id, device_timestamp),
         )
+
         conn.commit()
 
         updated = conn.execute(
             "SELECT * FROM students WHERE event_id = ? AND uid = ? LIMIT 1", (event_id, uid)
         ).fetchone()
         student = dict(updated) if updated else existing
+    except sqlite3.OperationalError as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        return jsonify({"error": "Database busy or error", "detail": str(e)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return jsonify({"success": True, "timestamp": now, "student": student})
 
@@ -1067,6 +1222,84 @@ def admin_open_event(event_id: int):
         conn.execute("UPDATE events SET is_active = 1 WHERE event_id = ?", (event_id,))
         conn.commit()
     _ensure_default_session(event_id)
+    return ("", 204)
+
+
+@app.post("/admin/events/<int:event_id>/clear")
+@admin_required
+def admin_clear_event(event_id: int):
+    """Clear roster, sessions and attendance for an event so it can be reused."""
+    if not _get_event(event_id):
+        return (jsonify({"error": "Invalid event_id"}), 404)
+
+    with _db() as conn:
+        # Remove per-session attendance and roster entries for this event
+        conn.execute("DELETE FROM session_attendance WHERE event_id = ?", (event_id,))
+        conn.execute("DELETE FROM students WHERE event_id = ?", (event_id,))
+        conn.execute("DELETE FROM sessions WHERE event_id = ?", (event_id,))
+
+        # Recreate a default session for this event
+        conn.execute(
+            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
+            (event_id, "Session 1", _now_str()),
+        )
+        conn.commit()
+
+    return ("", 204)
+
+
+@app.post("/admin/sessions/<int:session_id>/clear")
+@admin_required
+def admin_clear_session(session_id: int):
+    """Clear attendance for a specific session. If it's the active session for its event,
+    students' status is reset to 'Absent' as well."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if not row:
+            return (jsonify({"error": "Invalid session_id"}), 404)
+        session_row = dict(row)
+        event_id = int(session_row["event_id"]) if session_row.get("event_id") else None
+
+        # Delete session attendance rows
+        conn.execute("DELETE FROM session_attendance WHERE session_id = ?", (session_id,))
+
+        # If this session is the active session for the event, reset per-student attendance fields
+        active = _get_active_session(event_id) if event_id else None
+        if active and int(active.get("session_id") or 0) == int(session_id):
+            conn.execute(
+                "UPDATE students SET status = 'Absent', timestamp = '', source = 'Imported', device_id = '', device_timestamp = '' WHERE event_id = ?",
+                (event_id,),
+            )
+
+        conn.commit()
+
+    return ("", 204)
+
+
+@app.post("/admin/clear_all")
+@admin_required
+def admin_clear_all():
+    """Clear all app data and recreate a default event + session. Use with caution."""
+    with _db() as conn:
+        conn.execute("DELETE FROM session_attendance")
+        conn.execute("DELETE FROM students")
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM devices")
+        conn.execute("DELETE FROM events")
+        conn.commit()
+
+        # Seed a default event and session
+        conn.execute(
+            "INSERT INTO events (event_name, start_time, end_time, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("Default Event", "", "", 1, _now_str()),
+        )
+        seeded_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()[0])
+        conn.execute(
+            "INSERT INTO sessions (event_id, session_name, is_active, created_at) VALUES (?, ?, 1, ?)",
+            (seeded_id, "Session 1", _now_str()),
+        )
+        conn.commit()
+
     return ("", 204)
 
 

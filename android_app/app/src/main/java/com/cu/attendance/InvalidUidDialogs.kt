@@ -26,6 +26,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
 data class AlreadyMarkedResult(
     val uid: String,
@@ -115,19 +116,28 @@ fun InvalidUidDialog(
 @Composable
 fun AddStudentDialog(
     uid: String,
+    onUidChange: ((String) -> Unit)? = null,
     onSubmit: (name: String, branch: String, year: String) -> Unit,
     onDismiss: () -> Unit
 ) {
+    var localUid by remember { mutableStateOf(uid) }
     var name by remember { mutableStateOf("") }
     var branch by remember { mutableStateOf("") }
     var year by remember { mutableStateOf("") }
+
+    LaunchedEffect(uid) {
+        localUid = uid
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
             Button(
-                enabled = name.isNotBlank() && branch.isNotBlank() && year.isNotBlank(),
-                onClick = { onSubmit(name, branch, year) },
+                enabled = localUid.isNotBlank() && name.isNotBlank() && branch.isNotBlank() && year.isNotBlank(),
+                onClick = { 
+                    onUidChange?.invoke(localUid)
+                    onSubmit(name, branch, year) 
+                },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935))
             ) {
                 Text("Save & Mark")
@@ -145,14 +155,16 @@ fun AddStudentDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
 
                 OutlinedTextField(
-                    value = uid,
-                    onValueChange = {},
+                    value = localUid,
+                    onValueChange = { localUid = it },
                     label = { Text("UID") },
-                    enabled = false,
                     colors = OutlinedTextFieldDefaults.colors(
-                        disabledTextColor = Color.Gray,
-                        disabledBorderColor = Color.Gray,
-                        disabledLabelColor = Color.Gray
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFFE53935),
+                        unfocusedBorderColor = Color.Gray,
+                        focusedLabelColor = Color(0xFFE53935),
+                        unfocusedLabelColor = Color.Gray
                     )
                 )
 
@@ -244,6 +256,102 @@ fun AlreadyMarkedDialog(
         },
         containerColor = Color(0xFF2A2416),
         titleContentColor = Color(0xFFFFD54F),
+        textContentColor = Color.White
+    )
+}
+
+@Composable
+fun ConfirmAttendanceDialog(
+    uid: String,
+    name: String,
+    branch: String,
+    year: String,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFE53935)
+                )
+            ) {
+                Text("Confirm & Mark", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel", color = Color.White)
+            }
+        },
+        title = {
+            Text("Confirm Attendance", fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // UID (Read-only)
+                OutlinedTextField(
+                    value = uid,
+                    onValueChange = {},
+                    label = { Text("UID") },
+                    enabled = false,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        disabledTextColor = Color.Gray,
+                        disabledBorderColor = Color.Gray,
+                        disabledLabelColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Name (Read-only)
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = {},
+                    label = { Text("Name") },
+                    enabled = false,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        disabledTextColor = Color.Gray,
+                        disabledBorderColor = Color.Gray,
+                        disabledLabelColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Branch (Read-only)
+                OutlinedTextField(
+                    value = branch,
+                    onValueChange = {},
+                    label = { Text("Branch") },
+                    enabled = false,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        disabledTextColor = Color.Gray,
+                        disabledBorderColor = Color.Gray,
+                        disabledLabelColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Year (Read-only)
+                OutlinedTextField(
+                    value = year,
+                    onValueChange = {},
+                    label = { Text("Year") },
+                    enabled = false,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        disabledTextColor = Color.Gray,
+                        disabledBorderColor = Color.Gray,
+                        disabledLabelColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        containerColor = Color(0xFF1C1C1E),
+        titleContentColor = Color.White,
         textContentColor = Color.White
     )
 }

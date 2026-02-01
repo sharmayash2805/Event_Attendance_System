@@ -9,6 +9,15 @@ import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.widget.Toast
+import android.content.ContentValues
+import android.provider.MediaStore
+import android.os.Build
+import android.graphics.BitmapFactory
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.graphics.ImageFormat
+import android.graphics.YuvImage
+import java.io.ByteArrayOutputStream
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -69,7 +78,11 @@ class BarcodeScannerActivity : ComponentActivity() {
     )
 
     private var camera: Camera? = null
+    private var lastCapturedImageUri: android.net.Uri? = null
     private var isScanning = true
+    // Holds the captured image bytes for the currently-detected scan until user confirms
+    private var pendingCapturedBytes: ByteArray? = null
+    private var pendingCapturedUid: String? = null
     private var onScanListener: ((String) -> Unit)? = null
     private var lastScanTimestamp = 0L
     private var lastStableValue: String? = null
@@ -121,8 +134,10 @@ class BarcodeScannerActivity : ComponentActivity() {
             var showInvalidDialog by remember { mutableStateOf(false) }
             var showAddStudentDialog by remember { mutableStateOf(false) }
             var showAlreadyMarkedDialog by remember { mutableStateOf(false) }
+            var showConfirmDialog by remember { mutableStateOf(false) }
             var showMarkedDialog by remember { mutableStateOf(false) }
             var scannedUid by remember { mutableStateOf("") }
+            var scannedStudent by remember { mutableStateOf<StudentEntity?>(null) }
             var alreadyMarkedResult by remember { mutableStateOf<AlreadyMarkedResult?>(null) }
             var markedResult by remember { mutableStateOf<AlreadyMarkedResult?>(null) }
 			var markedSyncStatus by remember { mutableStateOf("Synced") }
@@ -148,6 +163,9 @@ class BarcodeScannerActivity : ComponentActivity() {
                         override fun onResult(status: String, student: StudentEntity?) {
                             when (status) {
                                 "INVALID" -> {
+                                    // clear any pending captured image for this uid
+                                    pendingCapturedBytes = null
+                                    pendingCapturedUid = null
                                     showInvalidDialog = true
                                 }
                                 "ALREADY" -> {
@@ -156,29 +174,20 @@ class BarcodeScannerActivity : ComponentActivity() {
                                         name = student?.name ?: "Unknown",
                                         time = student?.timestamp ?: ""
                                     )
+                                    // don't keep a pending photo for already marked UID
+                                    pendingCapturedBytes = null
+                                    pendingCapturedUid = null
                                     showAlreadyMarkedDialog = true
                                 }
                                 "SUCCESS" -> {
-                                    val displayName = student?.name?.ifBlank { uid } ?: uid
-                                    val displayTime = student?.timestamp?.ifBlank { nowString() } ?: nowString()
-                                    markedResult = AlreadyMarkedResult(
-                                        uid = student?.uid ?: uid,
-                                        name = displayName,
-                                        time = displayTime
-                                    )
-                                markedSyncStatus = "Synced"
-                                    showMarkedDialog = true
+                                    // Show confirmation dialog instead of immediately marking
+                                    scannedStudent = student
+                                    showConfirmDialog = true
                                 }
 							"QUEUED" -> {
-								val displayName = student?.name?.ifBlank { uid } ?: uid
-								val displayTime = student?.timestamp?.ifBlank { nowString() } ?: nowString()
-								markedResult = AlreadyMarkedResult(
-									uid = student?.uid ?: uid,
-									name = displayName,
-									time = displayTime
-								)
-                                markedSyncStatus = "Queued"
-								showMarkedDialog = true
+								// Show confirmation dialog instead of immediately marking
+								scannedStudent = student
+								showConfirmDialog = true
 							}
                                 else -> {
                                     Toast.makeText(this@BarcodeScannerActivity, "Error processing scan", Toast.LENGTH_SHORT).show()
@@ -242,6 +251,7 @@ class BarcodeScannerActivity : ComponentActivity() {
             if (showAddStudentDialog) {
                 AddStudentDialog(
                     uid = scannedUid,
+                    onUidChange = { newUid -> scannedUid = newUid },
                     onSubmit = { name, branch, year ->
                         addStudentAndMarkAttendance(scannedUid, name, branch, year)
                         showAddStudentDialog = false
@@ -259,6 +269,28 @@ class BarcodeScannerActivity : ComponentActivity() {
                     onDismiss = {
                         showAlreadyMarkedDialog = false
                         alreadyMarkedResult = null
+                        isScanning = true
+                    }
+                )
+            }
+
+            if (showConfirmDialog && scannedStudent != null) {
+                ConfirmAttendanceDialog(
+                    uid = scannedStudent!!.uid,
+                    name = scannedStudent!!.name,
+                    branch = scannedStudent!!.branch ?: "",
+                    year = scannedStudent!!.year ?: "",
+                    onConfirm = {
+                        showConfirmDialog = false
+                        // Save pending captured image (if any) then mark attendance
+                        savePendingCaptureAndMark(scannedStudent!!)
+                    },
+                    onCancel = {
+                        showConfirmDialog = false
+                        scannedStudent = null
+                        // clear any pending capture because user cancelled
+                        pendingCapturedBytes = null
+                        pendingCapturedUid = null
                         isScanning = true
                     }
                 )
@@ -380,7 +412,27 @@ class BarcodeScannerActivity : ComponentActivity() {
                             continue
                         }
 
+                        // Check if barcode is within the scanning region
+                        if (!isBarcodeInScanningRegion(box, imageProxy)) {
+                            continue
+                        }
+
                         if (isStableDecode(rawValue)) {
+                            // Capture one image bytes for this stable scan and cache it until confirmation
+                            try {
+                                if (pendingCapturedBytes == null) {
+                                    pendingCapturedBytes = imageProxyToJpegByteArray(imageProxy)
+                                    pendingCapturedUid = rawValue
+                                    Log.i(TAG, "Captured pending proof image for uid=$rawValue, bytes=${pendingCapturedBytes?.size}")
+                                } else {
+                                    Log.i(TAG, "Pending capture already exists for uid=${pendingCapturedUid}")
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error capturing pending image", e)
+                                pendingCapturedBytes = null
+                                pendingCapturedUid = null
+                            }
+
                             isScanning = false
                             lastScanTimestamp = now
                             consecutiveFailures = 0
@@ -415,6 +467,61 @@ class BarcodeScannerActivity : ComponentActivity() {
                 isScanning = true
             }
         )
+    }
+
+    private fun markAttendanceForScannedStudent(student: StudentEntity) {
+        attendanceViewModel.markStudentPresent(
+            uid = student.uid,
+            onSuccess = { markedStudent ->
+                val displayName = markedStudent.name.ifBlank { student.uid }
+                val msg = "Marked: $displayName"
+                runOnUiThread {
+                    Toast.makeText(this@BarcodeScannerActivity, msg, Toast.LENGTH_SHORT).show()
+                }
+                resetScanState()
+            },
+            onAlreadyMarked = { _ ->
+                runOnUiThread {
+                    Toast.makeText(this@BarcodeScannerActivity, "Already marked present", Toast.LENGTH_SHORT).show()
+                }
+                resetScanState()
+            },
+            onInvalid = {
+                runOnUiThread {
+                    Toast.makeText(this@BarcodeScannerActivity, "Invalid UID", Toast.LENGTH_SHORT).show()
+                }
+                isScanning = true
+            }
+        )
+    }
+
+    private fun savePendingCaptureAndMark(student: StudentEntity) {
+        val uid = student.uid
+        val bytes = pendingCapturedBytes
+        val pendingUid = pendingCapturedUid
+
+        // Clear pending capture immediately to avoid duplicate saves
+        pendingCapturedBytes = null
+        pendingCapturedUid = null
+
+        if (bytes != null && pendingUid == uid) {
+            // Save on background executor
+            cameraExecutor.execute {
+                val uri = saveJpegBytesToMediaStore(bytes, uid)
+                if (uri != null) {
+                    lastCapturedImageUri = uri
+                    Log.i(TAG, "Saved proof image after confirm: $uri")
+                } else {
+                    Log.w(TAG, "Failed to save proof image after confirm for uid=$uid")
+                }
+
+                // Continue with marking on main thread
+                runOnUiThread { markAttendanceForScannedStudent(student) }
+            }
+        } else {
+            // No pending image: just mark
+            markAttendanceForScannedStudent(student)
+        }
     }
 
     private fun showResult(message: String, success: Boolean) {
@@ -472,6 +579,29 @@ class BarcodeScannerActivity : ComponentActivity() {
         return boxMin < frameMin * MIN_BOX_FRACTION
     }
 
+    private fun isBarcodeInScanningRegion(box: android.graphics.Rect, proxy: ImageProxy): Boolean {
+        // Define scanning region: center 340x280 dp region
+        // Convert dp to pixels based on screen density
+        val density = this.resources.displayMetrics.density
+        val regionWidth = (340 * density).toInt()
+        val regionHeight = (280 * density).toInt()
+
+        // Calculate center-based scanning region
+        val centerX = proxy.width / 2
+        val centerY = proxy.height / 2
+        val regionLeft = centerX - (regionWidth / 2)
+        val regionTop = centerY - (regionHeight / 2)
+        val regionRight = centerX + (regionWidth / 2)
+        val regionBottom = centerY + (regionHeight / 2)
+
+        // Check if barcode center is within the scanning region
+        val barcodeCenter = box.centerX()
+        val barcodeCenterY = box.centerY()
+
+        return barcodeCenter >= regionLeft && barcodeCenter <= regionRight &&
+               barcodeCenterY >= regionTop && barcodeCenterY <= regionBottom
+    }
+
     private fun isStableDecode(value: String): Boolean {
         return if (value == lastStableValue) {
             stableDecodeCount += 1
@@ -480,6 +610,109 @@ class BarcodeScannerActivity : ComponentActivity() {
             lastStableValue = value
             stableDecodeCount = 1
             false
+        }
+    }
+
+    // Convert ImageProxy (YUV_420_888) to JPEG byte array synchronously.
+    private fun imageProxyToJpegByteArray(imageProxy: ImageProxy): ByteArray {
+        val yBuffer = imageProxy.planes[0].buffer
+        val uBuffer = imageProxy.planes[1].buffer
+        val vBuffer = imageProxy.planes[2].buffer
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+
+        yBuffer.get(nv21, 0, ySize)
+
+        // Try a reasonable interleaving fallback for U and V
+        // Many devices have V and U plane ordering; we interleave V then U as NV21 expects VU
+        var pos = ySize
+        val vBytes = ByteArray(vSize)
+        val uBytes = ByteArray(uSize)
+        vBuffer.get(vBytes)
+        uBuffer.get(uBytes)
+        var i = 0
+        while (i < vBytes.size && pos < nv21.size) {
+            nv21[pos++] = vBytes[i]
+            if (pos < nv21.size) {
+                nv21[pos++] = if (i < uBytes.size) uBytes[i] else 0
+            }
+            i++
+        }
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 90, out)
+        var jpegBytes = out.toByteArray()
+
+        // Rotate if needed
+        val rotation = imageProxy.imageInfo.rotationDegrees
+        if (rotation != 0) {
+            try {
+                var bmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                val rotatedOut = ByteArrayOutputStream()
+                rotated.compress(Bitmap.CompressFormat.JPEG, 90, rotatedOut)
+                jpegBytes = rotatedOut.toByteArray()
+                bmp.recycle()
+                rotated.recycle()
+            } catch (e: Exception) {
+                Log.w(TAG, "Rotation failed, saving original jpeg", e)
+            }
+        }
+
+        return jpegBytes
+    }
+
+    // Save JPEG bytes to MediaStore (Pictures/AttendanceProofs). Returns saved Uri or null.
+    private fun saveJpegBytesToMediaStore(jpegBytes: ByteArray, uid: String): android.net.Uri? {
+        try {
+            val fileName = "attendance_${uid}_${System.currentTimeMillis()}.jpg"
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/AttendanceProofs")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+
+            val resolver = contentResolver
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) return null
+
+            resolver.openOutputStream(uri).use { out ->
+                out?.write(jpegBytes)
+                out?.flush()
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+
+            return uri
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Permission denied saving image", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed saving image", e)
+        }
+        return null
+    }
+
+    // Capture and save the current ImageProxy synchronously (call before proxy is closed).
+    private fun saveImageProxyToGallerySync(imageProxy: ImageProxy, uid: String): android.net.Uri? {
+        return try {
+            val jpeg = imageProxyToJpegByteArray(imageProxy)
+            saveJpegBytesToMediaStore(jpeg, uid)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to capture/save image", e)
+            null
         }
     }
 
