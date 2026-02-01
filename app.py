@@ -10,7 +10,7 @@ from flask import Flask, jsonify, redirect, render_template, request, send_file,
 from sqlalchemy import and_, or_, func
 from sqlalchemy.exc import IntegrityError
 
-from db_new import engine, SessionLocal, get_db_session, Base
+from db import engine, SessionLocal, get_db_session, Base
 from models import Event, Student, Device, Session as DBSession, SessionAttendance
 
 UPLOAD_FOLDER = "uploads"
@@ -132,7 +132,7 @@ def _attendance_export_rows_for_session(*, event_id: int, session_id: int, prese
         if present_only:
             rows = db.query(
                 Student.uid, Student.name, Student.branch, Student.year,
-                func.literal("Present").label("status"),
+                "Present",
                 SessionAttendance.timestamp, SessionAttendance.source, SessionAttendance.device_id
             ).join(
                 SessionAttendance,
@@ -385,7 +385,7 @@ def _get_sessions(event_id: int) -> list[dict]:
     db = get_db_session()
     try:
         sessions = db.query(DBSession).filter(DBSession.event_id == event_id).order_by(DBSession.session_id.desc()).all()
-        return [dict(s.__dict__) for s in sessions]
+        return [{k: v for k, v in s.__dict__.items() if k != '_sa_instance_state'} for s in sessions]
     finally:
         db.close()
 
@@ -397,7 +397,7 @@ def _get_active_session(event_id: int) -> dict | None:
             DBSession.event_id == event_id,
             DBSession.is_active == 1
         ).order_by(DBSession.session_id.desc()).first()
-        return dict(session.__dict__) if session else None
+        return {k: v for k, v in session.__dict__.items() if k != '_sa_instance_state'} if session else None
     finally:
         db.close()
 
@@ -507,11 +507,15 @@ def list_events():
     active_only = request.args.get("active") == "1"
     db = get_db_session()
     try:
+        def orm_to_dict(obj):
+            d = dict(obj.__dict__)
+            d.pop('_sa_instance_state', None)
+            return d
         if active_only:
             events = db.query(Event).filter(Event.is_active == 1).order_by(Event.event_id.desc()).all()
         else:
             events = db.query(Event).order_by(Event.event_id.desc()).all()
-        return jsonify([dict(e.__dict__) for e in events])
+        return jsonify([orm_to_dict(e) for e in events])
     finally:
         db.close()
 
@@ -619,7 +623,8 @@ def admin_api_import_confirm():
         return jsonify({"error": "Excel must have uid and name columns"}), 400
 
     inserted = 0
-    with _db() as conn:
+    db = get_db_session()
+    try:
         for _, row in df.iterrows():
             uid = str(row.get("uid", "")).strip()
             name = str(row.get("name", "")).strip()
@@ -627,17 +632,23 @@ def admin_api_import_confirm():
             year = str(row.get("year", "")).strip()
             if not uid or not name:
                 continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO students
-                    (event_id, uid, name, branch, year, status, timestamp, source, device_id, device_timestamp)
-                VALUES
-                    (?, ?, ?, ?, ?, 'Absent', '', 'Imported', '', '')
-                """,
-                (event_id, uid, name, branch, year),
+            student = Student(
+                event_id=event_id,
+                uid=uid,
+                name=name,
+                branch=branch,
+                year=year,
+                status="Absent",
+                timestamp="",
+                source="Imported",
+                device_id="",
+                device_timestamp=""
             )
+            db.merge(student)
             inserted += 1
-        conn.commit()
+        db.commit()
+    finally:
+        db.close()
 
     try:
         os.remove(path)
@@ -752,7 +763,7 @@ def mark_attendance():
 
         # Check if already marked present
         if student.status and student.status.lower() == "present":
-            student_dict = dict(student.__dict__)
+            student_dict = {k: v for k, v in student.__dict__.items() if k != '_sa_instance_state'}
             db.close()
             return jsonify({"error": "Already marked", "student": student_dict}), 409
 
@@ -788,7 +799,7 @@ def mark_attendance():
             session_att.device_timestamp = device_timestamp
 
         db.commit()
-        student_dict = dict(student.__dict__)
+        student_dict = {k: v for k, v in student.__dict__.items() if k != '_sa_instance_state'}
         return jsonify({"success": True, "timestamp": now, "student": student_dict})
     except Exception as e:
         db.rollback()
@@ -1040,14 +1051,24 @@ def admin_api_dashboard():
         
         present_by_device = {row[0]: row[1] for row in device_att_counts}
 
+        # Get manually added entries (imported or manually added, not scanned from devices)
+        manual_att_counts = db.query(
+            func.count(SessionAttendance.uid).label("manual_count")
+        ).filter(
+            SessionAttendance.event_id == event_id,
+            SessionAttendance.session_id == session_id,
+            or_(SessionAttendance.device_id == '', SessionAttendance.source != 'Scanned')
+        ).scalar() or 0
+
         # Get device info
         devices = db.query(Device).filter(Device.last_event_id == event_id).all()
         device_info = {d.device_id: {"device_id": d.device_id, "last_seen": d.last_seen, "last_ip": d.last_ip} for d in devices}
 
         # Live attendance for the selected session
+        from sqlalchemy import literal
         attendance = db.query(
             Student.uid, Student.name, Student.branch, Student.year,
-            func.literal("Present").label("status"),
+            literal("Present").label("status"),
             SessionAttendance.timestamp, SessionAttendance.source, SessionAttendance.device_id
         ).join(
             SessionAttendance,
@@ -1093,6 +1114,7 @@ def admin_api_dashboard():
                 "server_time": _now_str(),
                 "summary": summary,
                 "device_stats": device_stats,
+                "manually_added_count": int(manual_att_counts),
                 "session_id": session_id,
                 "attendance": attendance_list,
             }
@@ -1381,9 +1403,10 @@ def api_event_live(event_id: int):
     
     db = get_db_session()
     try:
+        from sqlalchemy import literal
         recent = db.query(
             Student.uid, Student.name, Student.branch, Student.year,
-            func.literal("Present").label("status"),
+            literal("Present").label("status"),
             SessionAttendance.timestamp, SessionAttendance.source, SessionAttendance.device_id
         ).join(
             SessionAttendance,
